@@ -1,0 +1,13 @@
+.git
+.env.local
+.env.production
+.env.production.local
+.postly-data
+node_modules
+dist
+qa
+tests
+AGENTS.md
+design-qa.md
+interaction-qa.md
+*.log

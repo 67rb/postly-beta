@@ -1,0 +1,62 @@
+services:
+  postly:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "4174"
+      POSTLY_DISABLE_ENV_FILE: "1"
+      POSTLY_TRUST_PROXY_BASIC_AUTH: "1"
+      APP_BASE_URL: https://${POSTLY_DOMAIN:?Set POSTLY_DOMAIN in .env.production}
+      OAUTH_REDIRECT_BASE: https://${POSTLY_DOMAIN:?Set POSTLY_DOMAIN in .env.production}
+      PUBLIC_MEDIA_BASE_URL: https://${POSTLY_DOMAIN:?Set POSTLY_DOMAIN in .env.production}
+      POSTLY_DATA_DIR: /var/lib/postly
+      PUBLIC_MEDIA_STORAGE_DIR: /var/lib/postly/media
+      META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v26.0}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Set TOKEN_ENCRYPTION_KEY in .env.production}
+      INSTAGRAM_CLIENT_ID: ${INSTAGRAM_CLIENT_ID:-}
+      INSTAGRAM_CLIENT_SECRET: ${INSTAGRAM_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_KEY: ${TIKTOK_CLIENT_KEY:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      YOUTUBE_CLIENT_ID: ${YOUTUBE_CLIENT_ID:-}
+      YOUTUBE_CLIENT_SECRET: ${YOUTUBE_CLIENT_SECRET:-}
+    volumes:
+      - postly_data:/var/lib/postly
+    expose:
+      - "4174"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4174/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      postly:
+        condition: service_healthy
+    environment:
+      POSTLY_DOMAIN: ${POSTLY_DOMAIN:?Set POSTLY_DOMAIN in .env.production}
+      POSTLY_BASIC_AUTH_USER: ${POSTLY_BASIC_AUTH_USER:?Set POSTLY_BASIC_AUTH_USER in .env.production}
+      POSTLY_BASIC_AUTH_HASH: ${POSTLY_BASIC_AUTH_HASH:?Set POSTLY_BASIC_AUTH_HASH in .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postly_data:
+  caddy_data:
+  caddy_config:

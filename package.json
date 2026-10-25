@@ -8,7 +8,20 @@
     "start": "node server/index.js",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
-    "test:sites": "node --test tests/sites-worker.test.mjs"
+    "test:sites": "node --test tests/sites-worker.test.mjs",
+    "test:publishing": "node qa/verify-social-publishing.mjs",
+    "test:scheduler": "node qa/verify-scheduled-delivery.mjs && node qa/verify-scheduled-delivery-api.mjs",
+    "test:deployment-auth": "node qa/verify-deployment-auth.mjs",
+    "test:publish-ui": "node qa/verify-live-publish-ui.mjs",
+    "test:ideas": "node qa/verify-ideas-board.mjs",
+    "test:create-workspace": "node qa/verify-create-workspace.mjs",
+    "test:routes": "node qa/verify-workspace-routes.mjs",
+    "test:menus": "node qa/verify-workspace-menus.mjs",
+    "test:social-data": "node qa/verify-social-data.mjs",
+    "test:social-views": "node qa/verify-social-views.mjs",
+    "test:post-actions": "node qa/verify-post-actions.mjs",
+    "test:product-improvements": "node qa/verify-product-improvements.mjs",
+    "test:copy-and-start-page": "node qa/verify-copy-and-start-page.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "5.0.4",

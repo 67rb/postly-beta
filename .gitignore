@@ -1,4 +1,6 @@
 .env.local
+.env.production
+.env.production.local
 .postly-data/
 node_modules/
 dist/

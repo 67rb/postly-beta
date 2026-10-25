@@ -1,0 +1,60 @@
+services:
+  - type: web
+    name: postly
+    runtime: docker
+    plan: standard
+    region: singapore
+    numInstances: 1
+    healthCheckPath: /api/health
+    disk:
+      name: postly-data
+      mountPath: /var/lib/postly
+      sizeGB: 10
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "10000"
+      - key: POSTLY_DISABLE_ENV_FILE
+        value: "1"
+      - key: POSTLY_DATA_DIR
+        value: /var/lib/postly
+      - key: PUBLIC_MEDIA_STORAGE_DIR
+        value: /var/lib/postly/media
+      - key: APP_BASE_URL
+        fromService:
+          type: web
+          name: postly
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: OAUTH_REDIRECT_BASE
+        fromService:
+          type: web
+          name: postly
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: PUBLIC_MEDIA_BASE_URL
+        fromService:
+          type: web
+          name: postly
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: TOKEN_ENCRYPTION_KEY
+        generateValue: true
+      - key: POSTLY_BASIC_AUTH_USER
+        value: postly
+      - key: POSTLY_BASIC_AUTH_PASSWORD
+        sync: false
+      - key: META_GRAPH_API_VERSION
+        value: v26.0
+      - key: INSTAGRAM_CLIENT_ID
+        sync: false
+      - key: INSTAGRAM_CLIENT_SECRET
+        sync: false
+      - key: TIKTOK_CLIENT_KEY
+        sync: false
+      - key: TIKTOK_CLIENT_SECRET
+        sync: false
+      - key: YOUTUBE_CLIENT_ID
+        sync: false
+      - key: YOUTUBE_CLIENT_SECRET
+        sync: false

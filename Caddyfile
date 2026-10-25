@@ -1,0 +1,13 @@
+{$POSTLY_DOMAIN} {
+	@provider_media path /api/social/media/*
+	handle @provider_media {
+		reverse_proxy postly:4174
+	}
+
+	handle {
+		basic_auth {
+			{$POSTLY_BASIC_AUTH_USER} {$POSTLY_BASIC_AUTH_HASH}
+		}
+		reverse_proxy postly:4174
+	}
+}

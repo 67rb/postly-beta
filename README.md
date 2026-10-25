@@ -1,22 +1,8 @@
 # Postly
 
-> **BETA — experimental prototype.** Postly is not a production social-media publishing service. Live publishing, connected analytics, and production OAuth setup are not ready.
+> **Beta.** Postly is a social publishing workspace for creating, scheduling, and managing social content. This independent project is inspired by Buffer and is not affiliated with Buffer.
 
-Postly is a responsive social publishing workspace inspired by Buffer. It recreates a broad creator workflow across Home, Publish, calendar, Community, Create, Templates, Feeds, Insights, and Settings. The product name and interface are Postly; this independent project is not affiliated with Buffer.
-
-## What is in this beta
-
-- Responsive navigation and local flows for queues, drafts, scheduled posts, calendar, templates, ideas, community views, and settings.
-- Local persistence for queue and draft records, preferences, templates, and media previews.
-- OAuth flow scaffolding for Instagram, TikTok, and YouTube, with server-side token exchange and encrypted local token storage.
-- Sample/disconnected states for accounts and analytics, so the preview does not use private social account data.
-
-## Beta limits
-
-- Provider credentials and required reviews are not configured here; live account connections are unavailable in this snapshot.
-- OAuth account linking is implemented, but provider publishing APIs are not yet wired to send scheduled posts.
-- Live analytics, email sending, and a connected AI service are not implemented. Local analytics and account states are samples or disconnected prompts.
-- A production release needs provider approval, production callback URLs, a secrets manager, and provider-specific media upload/storage.
+The app includes a responsive creator workflow for drafts, queues, calendar, community, templates, feeds, insights, ideas, and settings. It persists local workspace data and includes server-side connection and publishing adapters for Instagram, TikTok, and YouTube.
 
 ## Run locally
 
@@ -27,6 +13,10 @@ npm install
 npm run dev
 ```
 
-For the standalone local server, use `npm start`. Copy `.env.example` to `.env.local` only if you are configuring local OAuth credentials. Keep `.env.local`, encrypted account data, and all provider secrets private; none belong in this repository. See [SOCIAL-CONNECTIONS.md](SOCIAL-CONNECTIONS.md) for setup and platform-specific limits.
+For the standalone server, run `npm start`. See [SOCIAL-CONNECTIONS.md](SOCIAL-CONNECTIONS.md) for provider setup, capabilities, and publishing constraints. Copy `.env.example` to `.env.local` only when configuring local provider credentials. Keep `.env.local`, encrypted provider account data, and secrets private; they do not belong in this repository.
 
-The project includes local worker/build packaging code for its original preview environment. It does not configure or deploy a production service by itself.
+## Deployment
+
+The app is designed for a single-owner hosted installation. See [DEPLOYMENT.md](DEPLOYMENT.md) and [MEDIA-HOSTING.md](MEDIA-HOSTING.md) for deployment, authentication, and media requirements. A public host and provider credentials must be configured before live hosted use. Do not expose this single-owner installation as a multi-user service without adding app authentication and per-user token isolation.
+
+Provider actions depend on each platform's credentials, scopes, review status, account eligibility, media rules, and quotas. The UI reports provider-confirmed outcomes and keeps local/demo states distinct from connected account data.
