@@ -1,7 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { InteractionPanel } from "./InteractionPanel.jsx";
+import { Popover } from "./Popover.jsx";
 import { Workspace } from "./Workspace.jsx";
-import { loadLocal, writeLocal, saveMedia, readMedia, pruneMedia, nextSlot, nextQuarter, scheduledDate } from "./local-data.js";
+import { applyPostAction, undoPostAction } from "./post-actions.js";
+import { cancelScheduledDelivery, fetchScheduledDeliveryStatuses, registerScheduledDelivery, retryScheduledDelivery } from "./scheduled-delivery-client.js";
+import { loadTemplates } from "./workspace-data.js";
+import { calendarDateInTimezone, formatInTimezone, loadLocal, writeLocal, saveMedia, readMedia, pruneMedia, nextAvailableSlot, nextQuarter, resolveTimezone, scheduledDateInTimezone } from "./local-data.js";
 import {
   AlertTriangle, ArrowDown, ArrowRight, ArrowUpRight, BarChart3, CalendarDays, Check, CheckCircle2, ChevronDown, CircleHelp,
   Clock3, Code2, FileText, Filter, Hash, Image as ImageIcon,
@@ -43,18 +47,80 @@ const blogPosts = [
   { title: "Best Time to Post on Instagram: New Data from 9.6 Million Posts", image: "/assets/blog/instagram-best-time.webp", date: "Jul 14, 2026", slug: "when-is-the-best-time-to-post-on-instagram" },
 ];
 
+const defaultTimezone = () => loadLocal("postly-preferences", {}).Timezone || "Johannesburg";
+const clockOptions = (hour12 = true) => ({ hour: "numeric", minute: "2-digit", hourCycle: hour12 ? "h12" : "h23" });
+const emptyChannelSchedule = timezone => ({ timezone, days: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"].map(day => ({ day, enabled: true, times: ["9:00 AM"] })) });
+
 const defaultChannels = [
-  { name: "Instagram", handle: "studio.notes", icon: siInstagram, color: "#e48b56" },
-  { name: "TikTok", handle: "studio.notes", icon: siTiktok, color: "#f1f1f1" },
-  { name: "YouTube", handle: "Clipper clip", icon: siYoutube, color: "#ec4036" },
+  { id: "6abbdc0fea19ca0bde244c7e", name: "Instagram", handle: "Your Instagram", icon: siInstagram, color: "#e48b56" },
+  { id: "6abbdb9eea19ca0bde244939", name: "TikTok", handle: "Your TikTok", icon: siTiktok, color: "#242424" },
+  { id: "6abbdadbea19ca0bde24433e", name: "YouTube", handle: "Your YouTube", icon: siYoutube, color: "#ec4036" },
 ];
+const providerForChannel = channel => ({ Instagram: "instagram", TikTok: "tiktok", YouTube: "youtube" })[channel?.name] || channel?.name?.toLowerCase() || "";
+const channelIndexForResult = (result, channels) => {
+  if (result.channelId) {
+    const index = channels.findIndex(channel => channel.id === result.channelId);
+    if (index >= 0) return index;
+  }
+  if (result.provider) {
+    const index = channels.findIndex(channel => providerForChannel(channel) === result.provider.toLowerCase());
+    if (index >= 0) return index;
+  }
+  return Number.isInteger(result.channelIndex) && result.channelIndex >= 0 ? result.channelIndex : -1;
+};
+const resultChannelName = result => result.channelName || ({ instagram: "Instagram", tiktok: "TikTok", youtube: "YouTube" })[result.provider] || result.provider || "Channel";
 
 const scheduleOptions = [
-  { label: "Next Available", detail: "Use the next available posting slot in your queue." },
-  { label: "Prioritize", detail: "Bump your post to the top of the queue." },
-  { label: "Now", detail: "Publish your post right away." },
-  { label: "Set Date and Time", detail: "Choose a specific time to post, or use our recommendation." },
+  { label: "Next Available", detail: "Schedule this for the next selected channel slot." },
+  { label: "Prioritize", detail: "Schedule this to send as soon as the Postly server can dispatch it." },
+  { label: "Now", detail: "Try to publish immediately to connected accounts." },
+  { label: "Set Date and Time", detail: "Choose when the Postly server should dispatch this post." },
 ];
+
+const imageMediaTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
+const tiktokPhotoTypes = new Set(["image/jpeg", "image/webp"]);
+const videoMediaTypes = new Set(["video/mp4", "video/quicktime", "video/webm"]);
+const supportedMediaTypes = new Set([...imageMediaTypes, ...videoMediaTypes]);
+const mediaTypeHint = "Use JPEG, PNG, WebP, MP4, MOV, or WebM files.";
+
+function validatePublishMedia(channelName, postType, attachments) {
+  const files = attachments || [];
+  const isImage = file => imageMediaTypes.has(file.type);
+  const isVideo = file => videoMediaTypes.has(file.type);
+  if (files.some(file => !supportedMediaTypes.has(file.type))) return mediaTypeHint;
+  if (files.some(file => !file.size)) return "Remove empty files and upload them again.";
+
+  if (channelName === "Instagram") {
+    if (!files.length) return "Add at least one supported photo or video.";
+    if (files.length > 10) return "Instagram supports up to 10 media items in a post.";
+    if (files.length > 1 && postType !== "Post") return "Choose Post for an Instagram carousel.";
+    if (files.length === 1 && isVideo(files[0]) && postType !== "Reel") return "Choose Reel for a single Instagram video.";
+    if (files.length === 1 && isImage(files[0]) && postType !== "Post") return "Choose Post for a single Instagram photo.";
+    return "";
+  }
+
+  if (channelName === "TikTok") {
+    if (postType === "Video") {
+      if (files.length !== 1) return "TikTok Video needs one video file.";
+      return isVideo(files[0]) ? "" : "TikTok Video accepts MP4, MOV, or WebM video.";
+    }
+    if (postType === "Photo") {
+      if (!files.length) return "TikTok Photo needs at least one photo.";
+      if (files.length > 35) return "TikTok Photo supports up to 35 images.";
+      if (files.some(file => !tiktokPhotoTypes.has(file.type))) return "TikTok Photo accepts JPEG or WebP images.";
+      if (files.some(file => file.size > 20 * 1024 * 1024)) return "TikTok photos must be 20 MB or smaller each.";
+      return "";
+    }
+    return "Choose Video or Photo for TikTok.";
+  }
+
+  if (channelName === "YouTube") {
+    if (files.length !== 1) return "YouTube needs one video file.";
+    return isVideo(files[0]) ? "" : "YouTube accepts MP4, MOV, or WebM video.";
+  }
+
+  return "";
+}
 
 function BrandMark({ size = 20 }) {
   return <span aria-hidden="true" className="postly-mark" style={{ width: size, height: size, fontSize: size * 0.72 }}>P</span>;
@@ -96,16 +162,17 @@ export function App() {
   const [aiPrompt, setAiPrompt] = useState("");
   const [customize, setCustomize] = useState(false);
   const [activeChannel, setActiveChannel] = useState("Instagram");
-  const [scheduleMenuOpen, setScheduleMenuOpen] = useState(false);
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [dateTimeSet, setDateTimeSet] = useState(false);
   const [scheduleMode, setScheduleMode] = useState("Date & Time");
-  const [selectedDate, setSelectedDate] = useState(nextQuarter);
+  const [scheduleTimezone, setScheduleTimezone] = useState(defaultTimezone);
+  const [selectedDate, setSelectedDate] = useState(() => calendarDateInTimezone(nextQuarter(), defaultTimezone()));
   const [calendarMonth, setCalendarMonth] = useState(() => {
-    const today = new Date();
+    const today = calendarDateInTimezone(new Date(), defaultTimezone());
     return new Date(today.getFullYear(), today.getMonth(), 1);
   });
-  const [selectedTime, setSelectedTime] = useState(() => nextQuarter().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true }));
+  const [startOfWeek, setStartOfWeek] = useState(() => loadLocal("postly-preferences", {})["Start of Week"] || "Sunday");
+  const [selectedTime, setSelectedTime] = useState(() => formatInTimezone(nextQuarter(), clockOptions(true), defaultTimezone()));
   const [templateQuery, setTemplateQuery] = useState("");
   const [templateTab, setTemplateTab] = useState("Discover");
   const [filterOpen, setFilterOpen] = useState(false);
@@ -113,14 +180,27 @@ export function App() {
   const [toast, setToast] = useState("");
   const toastTimer = useRef(null);
   const [records, setRecords] = useState(() => loadLocal("buffer-posts", []).filter(item => item && typeof item.id === "string" && typeof item.text === "string"));
+  const [postUndo, setPostUndo] = useState(() => {
+    const saved = loadLocal("postly-post-undo", {});
+    return saved.expiresAt > Date.now() && Array.isArray(saved.before) && Array.isArray(saved.after) ? saved : null;
+  });
   const [editingId, setEditingId] = useState(null);
   const [panel, setPanel] = useState("");
+  const [connectNetwork, setConnectNetwork] = useState("Instagram");
   const [organizationMenu, setOrganizationMenu] = useState(false);
   const [postMenu, setPostMenu] = useState(false);
   const [utilityMenu, setUtilityMenu] = useState("");
-  const [connected, setConnected] = useState(() => loadLocal("buffer-channels", ["Instagram", "TikTok", "YouTube"]).filter(item => ["Instagram", "TikTok", "YouTube"].includes(item)));
+  const [connected, setConnected] = useState(() => loadLocal("buffer-channels", ["Instagram", "TikTok", "YouTube"]).filter(item => ["Instagram", "TikTok", "YouTube", "LinkedIn", "Threads", "Bluesky", "Facebook", "Pinterest"].includes(item)));
   const [socialStatus, setSocialStatus] = useState({});
-  const [personalTemplates, setPersonalTemplates] = useState(() => loadLocal("buffer-templates", []).filter(item => item && typeof item.title === "string" && typeof item.description === "string"));
+  const refreshSocialStatus = useCallback(async () => {
+    try {
+      const response = await fetch("/api/social/status");
+      if (!response.ok) return;
+      const data = await response.json();
+      if (data?.providers) setSocialStatus(data.providers);
+    } catch { /* Keep the current status when the local OAuth API is unavailable. */ }
+  }, []);
+  const [personalTemplates, setPersonalTemplates] = useState(loadTemplates);
   const [templateEditor, setTemplateEditor] = useState(false);
   const [templateName, setTemplateName] = useState("");
   const [templateBody, setTemplateBody] = useState("");
@@ -133,17 +213,79 @@ export function App() {
   const [doneSteps, setDoneSteps] = useState(() => loadLocal("buffer-done-steps", []));
   const [uploadedFiles, setUploadedFiles] = useState([]);
   const [attachments, setAttachments] = useState([]);
+  const [mediaDragging, setMediaDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isPublishing, setIsPublishing] = useState(false);
+  const [isScheduling, setIsScheduling] = useState(false);
+  const [publishError, setPublishError] = useState("");
   const [createAnother, setCreateAnother] = useState(false);
   const [firstComment, setFirstComment] = useState(false);
   const [firstCommentText, setFirstCommentText] = useState("");
   const [productTags, setProductTags] = useState("");
   const [postTypes, setPostTypes] = useState({ Instagram: "Post", TikTok: "Video", YouTube: "Video" });
+  const [tiktokPrivacyLevel, setTiktokPrivacyLevel] = useState("");
+  const [tiktokCreatorInfo, setTiktokCreatorInfo] = useState(null);
+  const [tiktokInfoLoading, setTiktokInfoLoading] = useState(false);
+  const [tiktokInfoError, setTiktokInfoError] = useState("");
+  const [tiktokAllowComments, setTiktokAllowComments] = useState(true);
+  const [tiktokAllowDuet, setTiktokAllowDuet] = useState(true);
+  const [tiktokAllowStitch, setTiktokAllowStitch] = useState(true);
+  const [tiktokAutoAddMusic, setTiktokAutoAddMusic] = useState(true);
+  const [youtubePrivacyStatus, setYoutubePrivacyStatus] = useState("private");
   const [postingMethods, setPostingMethods] = useState({});
   const [mediaPreviews, setMediaPreviews] = useState({});
   const [profiles, setProfiles] = useState(() => loadLocal("buffer-profiles", {}));
   const [organizationName, setOrganizationName] = useState(() => loadLocal("buffer-organization-name", "My organization"));
   const channels = [...defaultChannels.map(channel => ({ ...channel, handle: socialStatus[channel.name.toLowerCase()]?.profile || profiles[channel.name] || channel.handle })), ...connected.filter(name => !defaultChannels.some(channel => channel.name === name)).map(name => ({ name, handle: socialStatus[name.toLowerCase()]?.profile || profiles[name] || "studio.notes", icon: ({ Threads: siThreads, Bluesky: siBluesky, Facebook: siFacebook, YouTube: siYoutube, Pinterest: siPinterest })[name], brand: ["Threads", "Bluesky", "Facebook", "YouTube", "Pinterest"].includes(name) ? undefined : UserRound, color: "#c8c8c4" }))];
+  const channelsRef = useRef(channels);
+  channelsRef.current = channels;
+  const refreshScheduledDeliveryStatuses = useCallback(async () => {
+    try {
+      const jobs = await fetchScheduledDeliveryStatuses();
+      const byPost = new Map();
+      for (const job of jobs) byPost.set(job.postId, [...(byPost.get(job.postId) || []), job]);
+      setRecords(current => current.map(record => {
+        if (!record.scheduleAt || !["scheduled", "published"].includes(record.status)) return record;
+        const serverJobs = byPost.get(record.id) || [];
+        if (!serverJobs.length) return record;
+        const previousByProvider = new Map((record.deliveryJobs || []).filter(item => item.provider).map(item => [item.provider, item]));
+        const serverProviders = new Set(serverJobs.map(job => job.provider));
+        const deliveryJobs = [
+          ...serverJobs.map(job => {
+            const activeChannels = channelsRef.current;
+            const channelIndex = (record.channels || []).find(index => providerForChannel(activeChannels[index]) === job.provider);
+            return { ...previousByProvider.get(job.provider), ...job, jobId: job.id, channelIndex, channelName: activeChannels[channelIndex]?.name || job.provider };
+          }),
+          ...(record.deliveryJobs || []).filter(item => !item.provider || !serverProviders.has(item.provider)),
+        ];
+        const publishedResults = deliveryJobs.filter(item => item.provider && item.status === "published").map(item => ({
+          provider: item.provider,
+          channelId: channelsRef.current[item.channelIndex]?.id || "",
+          channelIndex: item.channelIndex,
+          channelName: item.channelName,
+          status: "published",
+          remoteId: item.remoteId || "",
+          publishId: item.publishId || "",
+          error: "",
+        }));
+        const allChannelsPublished = (record.channels || []).length > 0 && record.channels.every(index => {
+          const provider = providerForChannel(channelsRef.current[index]);
+          return provider && deliveryJobs.some(item => item.provider === provider && item.status === "published");
+        });
+        const status = allChannelsPublished ? "published" : record.status;
+        const publishResults = allChannelsPublished ? [...(record.publishResults || []).filter(item => item.status !== "published"), ...publishedResults] : record.publishResults;
+        const summary = allChannelsPublished ? `Published to ${publishedResults.map(item => item.channelName).join(", ")}` : record.summary;
+        if (JSON.stringify(record.deliveryJobs || []) === JSON.stringify(deliveryJobs) && record.status === status && JSON.stringify(record.publishResults || []) === JSON.stringify(publishResults || []) && record.summary === summary) return record;
+        return { ...record, deliveryJobs, publishResults, status, summary, updatedAt: new Date().toISOString() };
+      }));
+    } catch { /* Keep cached per-channel status when the local scheduler API is unavailable. */ }
+  }, []);
+  useEffect(() => {
+    if (!window.location.pathname.startsWith("/schedule") || !records.some(record => record.status === "scheduled")) return;
+    refreshScheduledDeliveryStatuses();
+    window.addEventListener("focus", refreshScheduledDeliveryStatuses);
+    return () => window.removeEventListener("focus", refreshScheduledDeliveryStatuses);
+  }, [refreshScheduledDeliveryStatuses]);
   useEffect(() => { writeLocal("buffer-profiles", profiles); }, [profiles]);
   useEffect(() => { writeLocal("buffer-organization-name", organizationName); }, [organizationName]);
 
@@ -165,7 +307,7 @@ export function App() {
     return () => { cancelled = true; urls.forEach(url => URL.revokeObjectURL(url)); };
   }, [attachments]);
 
-  const snapshot = JSON.stringify({ postText, uploadedFiles, selectedChannels, firstComment, firstCommentText, productTags, disclosure, postTypes, postingMethods, scheduleMode, dateTimeSet, selectedTime, day: selectedDate.toDateString() });
+  const snapshot = JSON.stringify({ postText, uploadedFiles, selectedChannels, firstComment, firstCommentText, productTags, disclosure, postTypes, postingMethods, tiktokPrivacyLevel, youtubePrivacyStatus, tiktokAllowComments, tiktokAllowDuet, tiktokAllowStitch, tiktokAutoAddMusic, scheduleMode, dateTimeSet, selectedTime, timezone: scheduleTimezone, day: selectedDate.toDateString() });
   const dirty = composerOpen && baseline.current !== null && baseline.current !== snapshot && Boolean(postText.trim() || uploadedFiles.length);
   useEffect(() => { if (composerOpen && baseline.current === null) baseline.current = snapshot; });
   useEffect(() => {
@@ -175,20 +317,25 @@ export function App() {
     return () => window.removeEventListener("beforeunload", preventLoss);
   }, [dirty]);
   useEffect(() => {
-    const keep = new Set([...records.flatMap(record => record.attachments || []), ...attachments].map(item => item.id));
+    const keep = new Set([...records.flatMap(record => record.attachments || []), ...(postUndo?.before || []).flatMap(record => record.attachments || []), ...attachments].map(item => item.id));
     pruneMedia(keep).catch(() => {});
-  }, [records, attachments]);
+  }, [records, attachments, postUndo]);
+  useEffect(() => {
+    writeLocal("postly-post-undo", postUndo || {});
+    if (!postUndo) return;
+    const timer = window.setTimeout(() => setPostUndo(null), Math.max(0, postUndo.expiresAt - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [postUndo]);
 
   const filteredTemplates = useMemo(() => (templateTab === "Personal" || savedOnly ? personalTemplates : socialOnly ? templates : []).filter((item) => `${item.title} ${item.description}`.toLowerCase().includes(templateQuery.toLowerCase())), [templateQuery, templateTab, personalTemplates, savedOnly, socialOnly]);
   useEffect(() => { writeLocal("buffer-posts", records); }, [records]);
   useEffect(() => { writeLocal("buffer-channels", connected); }, [connected]);
   useEffect(() => {
-    const refreshAccounts = () => fetch("/api/social/status").then(response => response.ok ? response.json() : null).then(data => { if (data?.providers) setSocialStatus(data.providers); }).catch(() => {});
-    refreshAccounts();
-    window.addEventListener("focus", refreshAccounts);
-    return () => window.removeEventListener("focus", refreshAccounts);
-  }, []);
-  useEffect(() => { writeLocal("buffer-templates", personalTemplates); }, [personalTemplates]);
+    refreshSocialStatus();
+    window.addEventListener("focus", refreshSocialStatus);
+    return () => window.removeEventListener("focus", refreshSocialStatus);
+  }, [refreshSocialStatus]);
+  useEffect(() => { writeLocal("postly-templates", personalTemplates); }, [personalTemplates]);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const provider = params.get("connected");
@@ -211,7 +358,7 @@ export function App() {
       if (discardOpen) setDiscardOpen(false);
       else if (panel) setPanel("");
       else if (templateEditor) setTemplateEditor(false);
-      else if (datePickerOpen) { setDatePickerOpen(false); setScheduleMenuOpen(false); }
+      else if (datePickerOpen) setDatePickerOpen(false);
       else if (utilityMenu || organizationMenu || postMenu || filterOpen || newMenuOpen) { setUtilityMenu(""); setOrganizationMenu(false); setPostMenu(false); setFilterOpen(false); setNewMenuOpen(false); }
       else if (composerOpen) requestCloseComposer();
       else setSidebarOpen(false);
@@ -221,25 +368,71 @@ export function App() {
   }, [panel, templateEditor, datePickerOpen, utilityMenu, organizationMenu, postMenu, filterOpen, newMenuOpen, composerOpen, discardOpen, dirty]);
   const calendarDays = useMemo(() => {
     const firstDay = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1);
-    const start = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1 - firstDay.getDay());
+    const offset = (firstDay.getDay() - (startOfWeek === "Monday" ? 1 : 0) + 7) % 7;
+    const start = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1 - offset);
     return Array.from({ length: 42 }, (_, index) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + index));
-  }, [calendarMonth]);
+  }, [calendarMonth, startOfWeek]);
+  const scheduleToday = calendarDateInTimezone(new Date(), scheduleTimezone);
   const scheduleLabel = scheduleMode === "Date & Time"
     ? dateTimeSet ? `${selectedDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${selectedTime}` : "Date & Time"
     : scheduleMode;
   const effectiveMode = scheduleMode === "Date & Time" && !dateTimeSet ? "Next Available" : scheduleMode;
-  const chosenDate = scheduledDate(selectedDate, selectedTime);
-  const dateError = dateTimeSet && (scheduleMode === "Date & Time" || datePickerOpen) ? !chosenDate ? "Enter a valid time, such as 10:30 AM." : chosenDate.getTime() <= Date.now() ? "Choose a date and time in the future." : "" : "";
+  const chosenDate = scheduledDateInTimezone(selectedDate, selectedTime, scheduleTimezone);
+  const channelSchedules = selectedChannels.map(index => {
+    const channel = channels[index];
+    const timezone = loadLocal("postly-preferences", {}).Timezone || "Johannesburg";
+    return loadLocal(`postly-channel-schedule-${channel?.id || channel?.name?.toLowerCase() || `channel-${index}`}`, emptyChannelSchedule(timezone));
+  });
+  const scheduledAt = effectiveMode === "Now" ? null : effectiveMode === "Date & Time" ? chosenDate : effectiveMode === "Prioritize" ? new Date(Date.now() + 60000) : nextAvailableSlot(channelSchedules, scheduleTimezone);
+  const dateError = dateTimeSet && (scheduleMode === "Date & Time" || datePickerOpen) ? !chosenDate ? "Enter a valid time, such as 10:30 AM." : chosenDate.getTime() <= Date.now() ? "Choose a date and time in the future." : "" : effectiveMode === "Next Available" && !scheduledAt ? "Add an available time to the selected channel schedule first." : "";
   const postError = postText.length > 2200 ? "This post exceeds the 2,200 character limit." : !selectedChannels.length ? "Select at least one channel." : dateError;
-  const scheduledAt = effectiveMode === "Now" ? null : effectiveMode === "Date & Time" ? chosenDate : effectiveMode === "Prioritize" ? new Date(Date.now() + 60000) : nextSlot();
-  const scheduleSummary = effectiveMode === "Now" ? "Published locally just now" : `${scheduledAt?.toLocaleDateString("en-US", { month: "short", day: "numeric" }) || ""} · ${scheduledAt?.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true }) || ""}`;
+  const channelPublishChecks = selectedChannels.map(index => {
+    const channel = channels[index];
+    if (!channel) return { index, name: "Channel", error: "Select a valid channel." };
+    const mediaError = validatePublishMedia(channel.name, postTypes[channel.name] || (channel.name === "TikTok" ? "Video" : "Post"), attachments);
+    if (mediaError) return { index, name: channel.name, error: mediaError };
+    const provider = ({ Instagram: "instagram", TikTok: "tiktok", YouTube: "youtube" })[channel.name];
+    if (!provider) return { index, name: channel.name, error: `Live publishing is not available for ${channel.name} yet. This post can stay in the local queue.` };
+    if (!socialStatus[provider]?.connected) return { index, name: channel.name, error: `Connect an authorized ${channel.name} account before publishing.` };
+    if (channel.name === "TikTok" && (!tiktokCreatorInfo?.privacyLevelOptions?.includes(tiktokPrivacyLevel))) return { index, name: channel.name, error: "Choose one of the current TikTok audience options before publishing." };
+    return { index, name: channel.name, error: "" };
+  });
+  const publishValidationErrors = [
+    ...(postText.length > 2200 ? ["This post exceeds the 2,200 character limit."] : []),
+    ...(selectedChannels.length ? channelPublishChecks.filter(item => item.error).map(item => `${item.name}: ${item.error}`) : ["Select at least one channel."]),
+  ];
+  const scheduleSummary = effectiveMode === "Now" ? "Publishes immediately to connected channels" : `${formatInTimezone(scheduledAt,{month:"short",day:"numeric"},scheduleTimezone)} · ${formatInTimezone(scheduledAt,clockOptions(loadLocal("postly-preferences", {})["Time Format"] !== "24-hour"),scheduleTimezone)}`;
+
+  const shouldLoadTikTokInfo = customize && selectedChannels.some(index => channels[index]?.name === "TikTok") && Boolean(socialStatus.tiktok?.connected);
+  useEffect(() => {
+    if (!shouldLoadTikTokInfo) return;
+    const controller = new AbortController();
+    setTiktokCreatorInfo(null);
+    setTiktokInfoError("");
+    setTiktokInfoLoading(true);
+    fetch("/api/social/tiktok/creator-info", { signal: controller.signal })
+      .then(async response => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || "Could not load TikTok posting options.");
+        return data.creator;
+      })
+      .then(creator => {
+        if (controller.signal.aborted) return;
+        setTiktokCreatorInfo(creator || null);
+        setTiktokPrivacyLevel(current => creator?.privacyLevelOptions?.includes(current) ? current : "");
+      })
+      .catch(error => { if (!controller.signal.aborted) setTiktokInfoError(error.message || "Could not load TikTok posting options."); })
+      .finally(() => { if (!controller.signal.aborted) setTiktokInfoLoading(false); });
+    return () => controller.abort();
+  }, [shouldLoadTikTokInfo]);
 
   useEffect(() => {
     const surface = discardOpen ? document.querySelector(".discard-dialog") : panel ? document.querySelector(".interaction-dialog") : composerOpen ? document.querySelector(".composer-modal") : sidebarOpen ? document.querySelector(".sidebar") : null;
     if (!surface) return;
     const previous = document.activeElement;
     const controls = () => [...surface.querySelectorAll('button:not([disabled]), input:not([type="hidden"]):not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href]')].filter(element => element.getClientRects().length && !element.closest('[inert]'));
-    controls()[0]?.focus();
+    const preferred = surface.matches(".composer-modal") ? surface.querySelector("#composer-copy") : null;
+    (preferred || controls()[0])?.focus();
     const trap = event => {
       if (event.key !== "Tab") return;
       const elements = controls(), first = elements[0], last = elements.at(-1);
@@ -251,18 +444,26 @@ export function App() {
     return () => { document.removeEventListener("keydown", trap); if (previous?.isConnected) previous.focus(); };
   }, [panel, composerOpen, sidebarOpen, discardOpen]);
 
+  useEffect(() => {
+    if (!composerOpen && !panel) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [composerOpen, panel]);
+
   const notify = (message) => {
     setToast(message);
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(""), 2600);
   };
 
-  const openComposer = () => {
+  const openComposer = (options = {}) => {
     baseline.current = null;
     setDiscardOpen(false);
     setSidebarOpen(false);
     setNewMenuOpen(false);
-    setPostText("");
+    setPostText(options.text || "");
+    setSelectedChannels(options.channels || [0, 1, 2]);
     setEditingId(null);
     setSelectedTemplate(null);
     setUploadedFiles([]);
@@ -273,16 +474,30 @@ export function App() {
     setMediaPreviews({});
     setDisclosure(false);
     setPostTypes({ Instagram: "Post", TikTok: "Video", YouTube: "Video" });
+    setTiktokPrivacyLevel("");
+    setTiktokCreatorInfo(null);
+    setTiktokInfoError("");
+    setTiktokAllowComments(true);
+    setTiktokAllowDuet(true);
+    setTiktokAllowStitch(true);
+    setTiktokAutoAddMusic(true);
+    setYoutubePrivacyStatus("private");
+    setPublishError("");
     setPostingMethods({});
-    const next = nextQuarter();
-    setSelectedDate(next);
-    const defaultAction = loadLocal("postly-preferences", {})["Default Posting Action"] || "Date & Time";
-    const hour12 = loadLocal("postly-preferences", {})["Time Format"] !== "24-hour";
-    setSelectedTime(next.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12 }));
-    setCalendarMonth(new Date(next.getFullYear(), next.getMonth(), 1)); setDateTimeSet(defaultAction === "Set Date and Time"); setScheduleMode(defaultAction === "Set Date and Time" ? "Date & Time" : defaultAction);
+    const preferences = loadLocal("postly-preferences", {});
+    const timezone = preferences.Timezone || "Johannesburg";
+    setScheduleTimezone(timezone);
+    setStartOfWeek(preferences["Start of Week"] || "Sunday");
+    const requestedDate = options.date && new Date(options.date);
+    const next = requestedDate && Number.isFinite(requestedDate.getTime()) ? requestedDate : nextQuarter();
+    const calendarDate = calendarDateInTimezone(next, timezone);
+    setSelectedDate(calendarDate);
+    const defaultAction = preferences["Default Posting Action"] || "Date & Time";
+    const hour12 = preferences["Time Format"] !== "24-hour";
+    setSelectedTime(formatInTimezone(next, clockOptions(hour12), timezone));
+    setCalendarMonth(new Date(calendarDate.getFullYear(), calendarDate.getMonth(), 1)); setDateTimeSet(Boolean(options.date) || defaultAction === "Set Date and Time"); setScheduleMode(options.date || defaultAction === "Set Date and Time" ? "Date & Time" : defaultAction);
     setUtilityMenu("");
     setDatePickerOpen(false);
-    setScheduleMenuOpen(false);
     setPanel("");
     setToolPanel("");
     setCustomize(false);
@@ -295,10 +510,12 @@ export function App() {
     setComposerOpen(false);
     setToolPanel("");
     setCustomize(false);
-    setScheduleMenuOpen(false);
     setDatePickerOpen(false);
     setUtilityMenu("");
     setTemplateEditor(false);
+    const clean = new URL(window.location.href);
+    ["compose", "template", "edit", "panel", "network"].forEach(key => clean.searchParams.delete(key));
+    history.replaceState({}, "", clean.pathname + clean.search + clean.hash);
   };
 
   useEffect(() => {
@@ -315,27 +532,52 @@ export function App() {
       if (record) editPost(record);
     }
     if (params.get("panel")) setPanel(params.get("panel"));
+    if (["Instagram","TikTok","YouTube"].includes(params.get("network"))) setConnectNetwork(params.get("network"));
   }, []);
 
   const requestCloseComposer = () => {
-    if (isUploading) { notify("Wait for the media to finish saving."); return; }
+    if (isUploading || isPublishing) { notify(isPublishing ? "Wait for publishing to finish." : "Wait for the media to finish saving."); return; }
     if (dirty) setDiscardOpen(true);
     else closeComposer();
   };
 
   const toggleChannel = (index) => {
-    setSelectedChannels((current) => current.includes(index) ? current.filter((item) => item !== index) : [...current, index]);
+    const wasSelected = selectedChannels.includes(index);
+    const next = wasSelected ? selectedChannels.filter(item => item !== index) : [...selectedChannels, index];
+    setSelectedChannels(next);
+    if (!wasSelected || (channels[index]?.name === activeChannel && next.length)) setActiveChannel(channels[next[0]]?.name || channels[index]?.name || "Instagram");
   };
 
   const chooseSchedule = (label) => {
     setScheduleMode(label === "Set Date and Time" ? "Date & Time" : label);
-    setScheduleMenuOpen(false);
     if (label === "Set Date and Time") setDateTimeSet(true);
     setDatePickerOpen(label === "Set Date and Time");
   };
 
-  const storePost = status => {
-    const record = { id: editingId || crypto.randomUUID(), text: postText, files: uploadedFiles, attachments, scheduleMode: effectiveMode, scheduleAt: scheduledAt?.toISOString() || null, selectedTime, dateTimeSet, channels: selectedChannels, firstComment: firstComment ? firstCommentText : "", disclosure, productTags, postTypes, postingMethods, status, summary: status === "draft" ? "Saved draft" : scheduleSummary, createdAt: new Date().toISOString() };
+  const storePost = (status, options = {}) => {
+    const id = editingId || crypto.randomUUID();
+    const previous = records.find(item => item.id === id);
+    const previousPublish = ["published", "publishing"].includes(previous?.status) ? previous : null;
+    const channelsToStore = options.channels || selectedChannels;
+    const newResults = options.publishResults || [];
+    const sameResultChannel = (current, next) => current.channelId && next.channelId
+      ? current.channelId === next.channelId
+      : Boolean(current.provider && next.provider && current.provider === next.provider);
+    const publishResults = status === "scheduled" ? [] : [...(previousPublish?.publishResults || []).filter(item => !newResults.some(result => sameResultChannel(item, result))), ...newResults];
+    const finalStatus = status === "published"
+      ? publishResults.some(item => item.status === "publishing") ? "publishing"
+        : publishResults.some(item => item.status === "published") ? "published"
+          : newResults.some(item => item.status === "failed") ? "draft" : status
+      : status;
+    const storedChannels = [...new Set([...(previousPublish?.channels || []), ...channelsToStore])];
+    const successfulChannels = publishResults.filter(item => item.status === "published").map(item => item.privacyStatus === "private" && item.provider === "youtube" ? "YouTube privately" : resultChannelName(item));
+    const failedChannels = newResults.filter(item => item.status === "failed").map(resultChannelName);
+    const summary = finalStatus === "draft" && failedChannels.length ? `Could not publish to ${failedChannels.join(", ")}`
+      : finalStatus === "draft" ? "Saved draft"
+        : finalStatus === "publishing" ? "Sent to a channel; provider is still processing"
+          : status === "published" && effectiveMode === "Now" ? `Published to ${successfulChannels.join(", ")}${failedChannels.length ? ` · Failed: ${failedChannels.join(", ")}` : ""}`
+            : `Local queue · ${scheduleSummary}`;
+    const record = { id, text: postText, files: uploadedFiles, attachments, scheduleMode: effectiveMode, scheduleAt: status === "scheduled" ? scheduledAt?.toISOString() || null : null, selectedTime, timezone: scheduleTimezone, dateTimeSet, channels: storedChannels, firstComment: firstComment ? firstCommentText : "", disclosure, productTags, postTypes, postingMethods, tiktokPrivacyLevel, youtubePrivacyStatus, tiktokAllowComments, tiktokAllowDuet, tiktokAllowStitch, tiktokAutoAddMusic, tiktokDisableComments: !tiktokAllowComments || Boolean(tiktokCreatorInfo?.commentDisabled), tiktokDisableDuet: !tiktokAllowDuet || Boolean(tiktokCreatorInfo?.duetDisabled), tiktokDisableStitch: !tiktokAllowStitch || Boolean(tiktokCreatorInfo?.stitchDisabled), deliveryJobs: status === "scheduled" ? previous?.deliveryJobs || [] : [], publishResults, status: finalStatus, summary, createdAt: previous?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
     setRecords(current => [record, ...current.filter(item => item.id !== record.id)]);
     return record;
   };
@@ -343,22 +585,169 @@ export function App() {
     baseline.current = null;
     setPanel(""); setPostMenu(false); setSidebarOpen(false); setToolPanel(""); setCustomize(false); setDatePickerOpen(false);
     if (!record) return openComposer();
-    setEditingId(record.id); setPostText(record.text); setUploadedFiles(record.files || []); setAttachments(record.attachments || []); setSelectedChannels(record.channels || [0, 1, 2]); setSelectedTemplate(null); setFirstComment(Boolean(record.firstComment)); setFirstCommentText(record.firstComment || ""); setDisclosure(Boolean(record.disclosure)); setProductTags(record.productTags || ""); setPostTypes(record.postTypes || { Instagram: "Post", TikTok: "Video", YouTube: "Video" }); setPostingMethods(record.postingMethods || {});
+    const retryChannels = [...new Set((record.publishResults || []).filter(result => result.status === "failed").map(result => channelIndexForResult(result, channels)).filter(index => index >= 0))];
+    setEditingId(record.id); setPostText(record.text); setUploadedFiles(record.files || []); setAttachments(record.attachments || []); setSelectedChannels(retryChannels.length ? retryChannels : record.channels || [0, 1, 2]); setSelectedTemplate(null); setFirstComment(Boolean(record.firstComment)); setFirstCommentText(record.firstComment || ""); setDisclosure(Boolean(record.disclosure)); setProductTags(record.productTags || ""); setPostTypes(record.postTypes || { Instagram: "Post", TikTok: "Video", YouTube: "Video" }); setPostingMethods(record.postingMethods || {}); setTiktokPrivacyLevel(record.tiktokPrivacyLevel || ""); setTiktokAllowComments(record.tiktokAllowComments !== false); setTiktokAllowDuet(record.tiktokAllowDuet !== false); setTiktokAllowStitch(record.tiktokAllowStitch !== false); setTiktokAutoAddMusic(record.tiktokAutoAddMusic !== false); setYoutubePrivacyStatus(record.youtubePrivacyStatus || "private"); setPublishError("");
+    const timezone = record.timezone || defaultTimezone();
+    setScheduleTimezone(timezone);
     const restoredDate = record.scheduleAt && Number.isFinite(Date.parse(record.scheduleAt)) ? new Date(record.scheduleAt) : nextQuarter();
-    setSelectedDate(restoredDate); setCalendarMonth(new Date(restoredDate.getFullYear(), restoredDate.getMonth(), 1));
-    setSelectedTime(record.selectedTime || restoredDate.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true }));
+    const calendarDate = calendarDateInTimezone(restoredDate, timezone);
+    setSelectedDate(calendarDate); setCalendarMonth(new Date(calendarDate.getFullYear(), calendarDate.getMonth(), 1));
+    setSelectedTime(formatInTimezone(restoredDate, clockOptions(loadLocal("postly-preferences", {})["Time Format"] !== "24-hour"), timezone));
     setScheduleMode(record.scheduleMode || "Date & Time"); setDateTimeSet(Boolean(record.dateTimeSet)); setComposerOpen(true);
   };
-  const deletePost = id => { setRecords(current => current.filter(item => item.id !== id)); setPostMenu(false); notify("Post deleted"); };
-  const schedulePost = () => {
-    if ((!postText.trim() && !uploadedFiles.length) || postError || isUploading) return;
-    storePost(scheduleMode === "Now" ? "published" : "scheduled");
-    notify(scheduleMode === "Now" ? "Post saved as published in this demo" : "Post added to your local queue");
-    if (createAnother) { setEditingId(null); setPostText(""); setUploadedFiles([]); setAttachments([]); setSelectedTemplate(null); setToolPanel(""); setCustomize(false); }
-    else closeComposer();
+  const changePosts = async (action, ids) => {
+    if (action === "delete" || action === "draft") {
+      const scheduled = records.filter(record => ids.includes(record.id) && record.status === "scheduled");
+      for (const record of scheduled) {
+        const outcomes = await cancelScheduledDelivery(record, { channelNames: channels.map(channel => channel.name) });
+        const failures = outcomes.filter(item => item.status === "failed");
+        if (failures.length) {
+          const details = failures.map(item => `${item.channelName}: ${item.error}`).join(" · ");
+          setRecords(current => current.map(item => item.id === record.id ? {
+            ...item,
+            deliveryJobs: (item.deliveryJobs || []).map(job => outcomes.find(outcome => outcome.provider && outcome.provider === job.provider) || job),
+            summary: `Cancellation needs attention · ${details}`,
+            updatedAt: new Date().toISOString(),
+          } : item));
+          notify(`Could not safely cancel scheduled delivery. The post remains in your queue. ${details}`);
+          return;
+        }
+      }
+    }
+    const result = applyPostAction(records, ids, action);
+    if (!result) return;
+    setPostUndo(result.undo);
+    setRecords(result.records);
+    setToast("");
+    setPostMenu(false);
   };
-  const saveDraft = () => {
-    if (isUploading || (!postText.trim() && uploadedFiles.length === 0)) return;
+  const deletePost = id => changePosts("delete", [id]);
+  const undoPosts = () => {
+    if (!postUndo || postUndo.expiresAt <= Date.now()) { setPostUndo(null); return; }
+    setRecords(current => undoPostAction(current, postUndo));
+    setPostUndo(null);
+    notify("Action undone. Any newer edits were kept.");
+  };
+  const refreshPublishStatus = async record => {
+    const results = [];
+    for (const item of record.publishResults || []) {
+      if (item.provider !== "tiktok" || !item.publishId || item.status !== "publishing") { results.push(item); continue; }
+      try {
+        const response = await fetch(`/api/social/tiktok/publish-status?publishId=${encodeURIComponent(item.publishId)}`);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || "Could not check TikTok's status.");
+        results.push({ ...item, status: data.status, providerStatus: data.providerStatus, error: data.reason || "" });
+      } catch (error) { setPublishError(error.message || "Could not check TikTok's status."); return; }
+    }
+    const pending = results.some(item => item.status === "publishing");
+    const success = results.some(item => item.status === "published");
+    const status = pending ? "publishing" : success ? "published" : "draft";
+    const summary = pending ? "Sent to a channel; provider is still processing" : success ? `Published to ${results.filter(item => item.status === "published").map(item => item.provider).join(", ")}` : "TikTok could not publish this post; edit it and try again";
+    setRecords(current => current.map(item => item.id === record.id ? { ...item, publishResults: results, status, summary, updatedAt: new Date().toISOString() } : item));
+    notify(pending ? "TikTok is still processing this post" : success ? "TikTok finished publishing this post" : "TikTok could not publish this post");
+  };
+  const retryScheduledChannel = async (record, deliveryJob, confirmDuplicateRisk = false) => {
+    const outcome = await retryScheduledDelivery(record, deliveryJob, { confirmDuplicateRisk });
+    if (outcome.status === "failed") {
+      notify(`${outcome.channelName}: ${outcome.error}`);
+      return;
+    }
+    setRecords(current => current.map(item => item.id === record.id ? {
+      ...item,
+      deliveryJobs: (item.deliveryJobs || []).map(job => job.provider === outcome.provider ? { ...job, ...outcome } : job),
+      summary: `Retry queued · ${outcome.channelName}`,
+      updatedAt: new Date().toISOString(),
+    } : item));
+    notify(`${outcome.channelName} delivery retry queued on this Postly server.`);
+  };
+  const schedulePost = async () => {
+    if ((!postText.trim() && !uploadedFiles.length) || postError || isUploading || isPublishing || isScheduling) return;
+    if (scheduleMode === "Now" && publishValidationErrors.length) return;
+    if (scheduleMode !== "Now") {
+      setIsScheduling(true);
+      setPublishError("");
+      const record = storePost("scheduled");
+      try {
+        const outcomes = await registerScheduledDelivery(record, { readMedia, channelNames: channels.map(channel => channel.name) });
+        const failures = outcomes.filter(item => item.status === "failed");
+        const successful = outcomes.filter(item => item.status !== "failed");
+        const summary = failures.length
+          ? `Scheduled delivery needs attention · ${failures.map(item => `${item.channelName}: ${item.error}`).join(" · ")}`
+          : `Scheduled delivery saved · ${successful.map(item => item.channelName).join(", ")}`;
+        setRecords(current => current.map(item => item.id === record.id ? { ...item, deliveryJobs: outcomes, summary, updatedAt: new Date().toISOString() } : item));
+        await refreshScheduledDeliveryStatuses();
+        if (failures.length) notify(`Post saved in Queue, but delivery could not be registered for ${failures.map(item => item.channelName).join(", ")}. Check the channel status before its scheduled time.`);
+        else notify("Scheduled delivery saved on this Postly server. The server dispatches due posts and resumes them after restart.");
+        if (createAnother) openComposer({channels:selectedChannels});
+        else closeComposer();
+        baseline.current = null;
+      } finally { setIsScheduling(false); }
+      return;
+    }
+
+    setIsPublishing(true);
+    setPublishError("");
+    const posted = [];
+    const failed = [];
+    try {
+      for (const index of selectedChannels) {
+        const channel = channels[index];
+        const provider = ({ Instagram: "instagram", TikTok: "tiktok", YouTube: "youtube" })[channel?.name];
+        if (!provider) { failed.push({ index, name: channel?.name || "Channel", error: "Live publishing is not available for this channel yet." }); continue; }
+        try {
+          const form = new FormData();
+          form.append("post", JSON.stringify({ text: postText, postType: postTypes[channel.name] || "", tiktokPrivacyLevel, youtubePrivacyStatus, disableComments: !tiktokAllowComments || Boolean(tiktokCreatorInfo?.commentDisabled), disableDuet: !tiktokAllowDuet || Boolean(tiktokCreatorInfo?.duetDisabled), disableStitch: !tiktokAllowStitch || Boolean(tiktokCreatorInfo?.stitchDisabled), autoAddMusic: tiktokAutoAddMusic, disclosure }));
+          for (const attachment of attachments) {
+            const blob = await readMedia(attachment.id);
+            if (!blob) throw new Error(`Could not read ${attachment.name || "the selected media"} from this browser. Upload it again.`);
+            form.append("media", blob, attachment.name || "media");
+          }
+          const response = await fetch(`/api/social/${provider}/publish`, { method: "POST", body: form });
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(body.error || `${channel.name} could not publish this post.`);
+          if (!["published", "publishing"].includes(body.status)) throw new Error(body.error || `${channel.name} did not confirm publication.`);
+          posted.push({ index, result: body });
+        } catch (error) { failed.push({ index, name: channel?.name || "Channel", error: error.message || "Could not publish this post." }); }
+      }
+      const attemptedResults = [
+        ...posted.map(({ index, result }) => ({ provider: result.provider || providerForChannel(channels[index]), channelId: channels[index]?.id || "", channelIndex: index, channelName: channels[index]?.name || "Channel", status: result.status, remoteId: result.remoteId || "", publishId: result.publishId || "", privacyStatus: result.privacyStatus || "", privacyLevel: result.privacyLevel || "", error: "" })),
+        ...failed.map(item => ({ provider: providerForChannel(channels[item.index]), channelId: channels[item.index]?.id || "", channelIndex: item.index, channelName: item.name, status: "failed", error: item.error, remoteId: "", publishId: "", privacyStatus: "", privacyLevel: "" })),
+      ];
+      const record = attemptedResults.length ? storePost("published", { channels: selectedChannels, publishResults: attemptedResults }) : null;
+      if (failed.length) {
+        if (record) setEditingId(record.id);
+        setSelectedChannels(failed.map(item => item.index));
+        setActiveChannel(channels[failed[0].index]?.name || "Instagram");
+        const publishedNames = posted.filter(item => item.result.status === "published").map(item => channels[item.index]?.name || "Channel");
+        setPublishError(`${publishedNames.length ? `Published to ${publishedNames.join(", ")}. ` : ""}${failed.map(item => `${item.name}: ${item.error}`).join(" · ")} Only the channels that failed remain selected${publishedNames.length ? ", so retrying won't repost to the successful accounts." : " for retry."}`);
+        return;
+      }
+      if (posted.length) {
+        if (posted.some(item => item.result.status === "publishing")) notify("TikTok accepted the post and is still processing it. Check the Publishing tab for status.");
+        else notify(`Published to ${posted.map(item => channels[item.index]?.name).join(", ")}`);
+        if (createAnother) openComposer({ channels: selectedChannels });
+        else closeComposer();
+        baseline.current = null;
+      } else setPublishError("No selected channel could publish this post.");
+    } finally { setIsPublishing(false); }
+  };
+  const saveDraft = async () => {
+    if (isUploading || isScheduling || (!postText.trim() && uploadedFiles.length === 0)) return;
+    const previous = records.find(item => item.id === editingId);
+    if (previous?.status === "scheduled") {
+      const outcomes = await cancelScheduledDelivery(previous, { channelNames: channels.map(channel => channel.name) });
+      const failures = outcomes.filter(item => item.status === "failed");
+      if (failures.length) {
+        setRecords(current => current.map(item => item.id === previous.id ? {
+          ...item,
+          deliveryJobs: (item.deliveryJobs || []).map(job => outcomes.find(outcome => outcome.provider && outcome.provider === job.provider) || job),
+          summary: `Cancellation needs attention · ${failures.map(item => `${item.channelName}: ${item.error}`).join(" · ")}`,
+          updatedAt: new Date().toISOString(),
+        } : item));
+        notify(`Could not safely cancel scheduled delivery. The post remains in your queue. ${failures.map(item => `${item.channelName}: ${item.error}`).join(" · ")}`);
+        return;
+      }
+    }
     storePost("draft"); notify("Draft saved locally"); closeComposer();
   };
 
@@ -383,7 +772,11 @@ export function App() {
     const files = Array.from(event.target?.files || event.dataTransfer?.files || []);
     if (event.target?.type === "file") event.target.value = "";
     if (!files.length) return;
-    if (files.some(file => !file.type.startsWith("image/") && !file.type.startsWith("video/"))) { notify("Choose image or video files."); return; }
+    if (files.some(file => !supportedMediaTypes.has(file.type))) { notify(mediaTypeHint); return; }
+    if (files.some(file => !file.size)) { notify("Empty media files can't be added. Choose another file."); return; }
+    if (attachments.length + files.length > 35) { notify("A post can include at most 35 media files."); return; }
+    const currentSize = attachments.reduce((total, item) => total + (item.size || 0), 0);
+    if (currentSize + files.reduce((total, file) => total + file.size, 0) > 250 * 1024 * 1024) { notify("Uploads must stay under 250 MB per post."); return; }
     setIsUploading(true);
     try {
       const saved = await Promise.all(files.map(saveMedia));
@@ -399,145 +792,30 @@ export function App() {
   const now = new Date();
   const greeting = now.getHours() < 12 ? "Good Morning" : now.getHours() < 18 ? "Good Afternoon" : "Good Evening";
 
-  const routeParams = new URLSearchParams(window.location.search);
-  if (!["/", "/home"].includes(window.location.pathname) || (!routeParams.has("compose") && !routeParams.has("panel") && !routeParams.has("edit"))) {
-    return <Workspace
-      path={["/", "/home"].includes(window.location.pathname) ? "/home" : window.location.pathname}
-      organizationName={organizationName}
-      onOrganizationChange={setOrganizationName}
-      connected={connected}
-      socialStatus={socialStatus}
-      records={records}
-      onDelete={deletePost}
-      scheduledCount={scheduledPosts}
-      onCompose={() => window.location.assign("/home?compose=1")}
-      onConnect={() => window.location.assign("/home?panel=Connect%20Channel")}
-    />;
-  }
+  const duplicatePost = record => changePosts("duplicate", [record.id]);
 
   return (
-    <div className="app-shell">
-      <input id="media-upload" type="file" accept="image/*,video/*" multiple hidden onChange={changeFiles} />
-      <header className="topbar" inert={Boolean(panel || composerOpen || sidebarOpen)}>
-        <div className="topbar-left">
-          <button className="icon-button top-menu" aria-label="Open menu" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
-          <button className="brand-lockup" onClick={() => sidebarAction("Home")} aria-label="Postly home"><BrandMark size={20} /><span>Postly</span></button>
-        </div>
-        <button className="streak-button" onClick={() => notify("Your weekly posting streak starts with your first post")}><Sprout size={18} /><span className="streak-count">0</span></button>
-      </header>
-
-      <main className="dashboard" inert={Boolean(panel || composerOpen || sidebarOpen)}>
-        <div className="welcome-row">
-          <div className="welcome-left">
-            <div className="weather-icon"><Moon size={21} fill="currentColor" strokeWidth={1.5} /></div>
-            <div><h1>{greeting}, creator!</h1><p>{now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" })}</p></div>
-          </div>
-          <div className="welcome-actions">
-            <button className="icon-button subtle" aria-label="Share Feedback" onClick={() => setPanel("Share Feedback")}><MessageSquareText size={17} /></button>
-            <button className="sync-status" aria-label="About sync status" onClick={() => notify("All channels are synced")}><span className="sync-dot"><Check size={11} /></span></button>
-          </div>
-        </div>
-
-        <section className="scorecard" aria-label="Your scorecard">
-          <div className="score-item">
-            <div className="score-ring">0</div>
-            <strong>Week Streak <button className="tiny-info" aria-label="About Week Streak" onClick={() => notify("Your streak grows when you post each week")}><CircleHelp size={14} /></button></strong>
-            <button className="score-link" onClick={() => notify("Start your streak by scheduling a post")}>Start your streak today</button>
-          </div>
-          <div className="score-item">
-            <div className="score-ring">0</div>
-            <strong>Posting Goals <button className="tiny-info" aria-label="About Posting Goals" onClick={() => notify("Your weekly goals will show here")}><CircleHelp size={14} /></button></strong>
-            <span>No goals met yet</span>
-          </div>
-          <div className="score-item">
-            <div className="score-ring">0</div>
-            <strong>Comment Score <button className="tiny-info" aria-label="About Comment Score" onClick={() => notify("Your community activity will show here")}><CircleHelp size={14} /></button></strong>
-            <span>Holding steady</span>
-          </div>
-        </section>
-
-        <section className="first-steps-section">
-          <h2>First Steps</h2>
-          <div className="steps-list">
-            {[
-              { title: "Connect a channel", description: "Authorize a social account to connect it to Postly.", action: "Connect Channel", handler: () => setPanel("Connect Channel") },
-              { title: "Create a post", description: "Schedule your first post in just a few clicks.", action: "Create Post", handler: openComposer },
-              { title: "Explore Postly API", description: "Connect to your agents, automation tools, and more.", action: "Get Started", handler: () => setPanel("Explore Postly API") },
-            ].map((step, index) => (
-              <article className={`step-card ${doneSteps.includes(index) ? "step-done" : ""}`} key={step.title}>
-                <button className="step-check" aria-label={doneSteps.includes(index) ? "Mark as not done" : "Mark as done"} aria-pressed={doneSteps.includes(index)} onClick={() => markStep(index)}><CheckCircle2 size={17} /></button>
-                <div className="step-copy"><h3>{index + 1}. {step.title}</h3><p>{step.description}</p></div>
-                <button className="outline-action" onClick={step.handler}>{index === 0 ? <Plus size={16} /> : index === 1 ? <FileText size={16} /> : <Code2 size={15} />}{step.action}</button>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <div className="activity-grid">
-          <section className="activity-section">
-            <div className="section-heading"><h2>Up Next</h2><span className="count-badge">· &nbsp;{scheduledPosts} posts scheduled</span><button className="text-icon-button" aria-label="View all scheduled posts" onClick={() => setPanel("Publish")}><ArrowUpRight size={16} /></button></div>
-            <div className={`empty-card ${scheduledPosts ? "has-post" : ""}`}>
-              {scheduledPosts ? <><div className="empty-icon"><CalendarDays size={19} /></div><div className="empty-copy"><strong>{scheduledRecords[0]?.text || "Media post"}</strong><span>{scheduledRecords[0]?.summary}</span></div><div className="post-menu-wrap" data-popover><button className="more-button" aria-label="More post options" aria-haspopup="menu" aria-expanded={postMenu} onClick={() => setPostMenu(value => !value)}><MoreHorizontal size={18} /></button>{postMenu && <div className="post-options-menu popup-menu" role="menu"><button role="menuitem" onClick={() => editPost(scheduledRecords[0])}>Edit post</button><button role="menuitem" onClick={() => { const post = scheduledRecords[0]; setRecords(current => [{ ...post, id: crypto.randomUUID(), status: "draft", summary: "Saved draft" }, ...current]); setPostMenu(false); notify("Copied to drafts"); }}>Copy to drafts</button><button role="menuitem" onClick={() => deletePost(scheduledRecords[0].id)}>Delete post</button></div>}</div></> : <><div className="empty-copy"><strong>No posts scheduled yet.</strong><span>You'll see upcoming posts here.</span></div><button className="small-action" onClick={openComposer}><Plus size={15} />Create Post</button></>}
-            </div>
-          </section>
-          <section className="activity-section">
-            <div className="section-heading"><h2>Comments</h2><span className="count-badge">· &nbsp;0 unanswered</span><button className="text-icon-button" aria-label="View all comments" onClick={() => setPanel("Comments")}><ArrowUpRight size={16} /></button></div>
-            <div className="empty-card">
-              <div className="empty-copy"><strong>No comments yet.</strong><span>You'll see the latest posts here.</span></div>
-              <button className="small-action" onClick={() => sidebarAction("Community")}><MessageCircle size={15} />Community</button>
-            </div>
-          </section>
-        </div>
-
-        <section className="templates-section">
-          <div className="section-heading"><h2>Templates</h2><button className="view-all" onClick={() => { setToolPanel("templates"); setComposerOpen(true); }}>View all <ArrowUpRight size={15} /></button></div>
-          <div className="template-grid">
-            {templates.map((item) => <button className="template-card" key={item.title} onClick={() => { setPostText(`${item.title}\n\n${item.description}`); setSelectedTemplate(item.title); setComposerOpen(true); }}>
-              <span className="template-icon"><TemplateIcon name={item.icon} /></span><h3>{item.title}</h3><p>{item.description}</p>
-            </button>)}
-          </div>
-        </section>
-
-        <section className="blog-section" id="blog">
-          <div className="section-heading"><h2>From the Blog</h2><a className="view-all" href="https://buffer.com/resources/" target="_blank" rel="noreferrer">View All Articles <ArrowUpRight size={15} /></a></div>
-          <div className="blog-grid">
-            {blogPosts.map((post) => <a key={post.title} className="blog-card" href={`https://buffer.com/resources/${post.slug}/`} target="_blank" rel="noreferrer"><img className="blog-thumb" src={post.image} alt={post.title} /><div className="blog-meta"><span className="blog-label">Blog post</span><time>{post.date}</time></div><span className="blog-title">{post.title}</span><ArrowRight size={16} className="blog-arrow" /></a>)}
-          </div>
-        </section>
-      </main>
-
-      <button inert={Boolean(panel || composerOpen || sidebarOpen)} className="help-button" aria-label="Help center" onClick={() => setPanel("Help center") }><CircleHelp size={20} /></button>
-
-      {sidebarOpen && <>
-        <button className="scrim sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />
-        <aside inert={Boolean(panel || composerOpen)} className="sidebar" aria-label="Main navigation">
-          <div className="sidebar-top"><button className="brand-lockup" onClick={() => sidebarAction("Home")}><BrandMark size={20} /><span>Postly</span></button><button className="icon-button" aria-label="Close menu" onClick={() => setSidebarOpen(false)}><X size={19} /></button></div>
-          <div className="new-menu-wrap" data-popover><button className="new-button" aria-expanded={newMenuOpen} onClick={() => setNewMenuOpen((value) => !value)}><Plus size={17} />New <ChevronDown size={15} className={newMenuOpen ? "rotate" : ""} /></button>
-            {newMenuOpen && <div className="new-menu" role="menu"><button onClick={openComposer}><FileText size={16} /><span><b>Post</b><small>Publish content to a channel</small></span></button><button onClick={() => { setNewMenuOpen(false); setSidebarOpen(false); setPanel("Idea"); }}><Sparkles size={16} /><span><b>Idea</b><small>Capture a content idea</small></span></button><button onClick={() => setPanel("Connect Channel")}><Plus size={16} /><span><b>Connect a New Channel</b></span></button><button onClick={() => setPanel("Create a Start Page")}><Link2 size={16} /><span><b>Create a Start Page</b></span></button><button onClick={() => setPanel("Invite a Team Member")}><Send size={16} /><span><b>Invite a Team Member</b></span></button></div>}
-          </div>
-          <nav className="side-nav">
-            <button className="active" onClick={() => sidebarAction("Home")}><Inbox size={17} />Home</button>
-            <button onClick={() => sidebarAction("Create")}><FileText size={17} />Create</button>
-            <button onClick={() => sidebarAction("Publish")}><CalendarDays size={17} />Publish<span className="nav-count">{scheduledPosts}</span></button>
-            <button onClick={() => sidebarAction("Community")}><MessageCircle size={17} />Community</button>
-            <button onClick={() => sidebarAction("Insights")}><BarChart3 size={17} />Insights</button>
-          </nav>
-          <div className="channel-list"><div className="side-section-title">CHANNELS <button aria-label="Add channel" onClick={() => setPanel("Connect Channel")}><Plus size={15} /></button></div>
-            {channels.map((channel) => <button className="connected-channel" key={channel.name} onClick={() => setPanel("Publish")}><span className="small-social"><SocialMark icon={channel.icon} brand={channel.brand} color={channel.color} size={14} /></span><span>{channel.name}</span><span aria-label={socialStatus[channel.name.toLowerCase()]?.connected ? "Account connected" : "Account not connected"} className={socialStatus[channel.name.toLowerCase()]?.connected ? "online-dot" : "offline-dot"} /></button>)}
-            <div className="connect-label">Connect more channels</div>
-            {[{ name: "Threads", icon: siThreads }, { name: "LinkedIn", brand: FaLinkedinIn }, { name: "Bluesky", icon: siBluesky }].map((item) => <button className="connect-channel" key={item.name} onClick={() => setPanel("Connect Channel")}><span className="small-social"><SocialMark icon={item.icon} brand={item.brand} color="#d9d9d9" size={14} /></span>{item.name}<Plus size={14} /></button>)}
-            <button className="more-channels" onClick={() => setPanel("Connect Channel")}>More channels <ChevronDown size={14} /></button>
-          </div>
-          <div className="organization-wrap" data-popover><button className="organization" aria-label="Organization menu" aria-haspopup="menu" aria-expanded={organizationMenu} onClick={() => setOrganizationMenu(value => !value)}><span className="org-avatar">S</span><span><b>{organizationName}</b><small>Free Plan</small></span><MoreHorizontal size={17} /></button>{organizationMenu && <div className="organization-menu popup-menu" role="menu">{["Organization settings", "Manage channels", "Drafts", "Help center"].map(title => <button role="menuitem" key={title} onClick={() => { setOrganizationMenu(false); setPanel(title); }}>{title}{title === "Drafts" ? ` (${drafts})` : ""}</button>)}</div>}</div>
-        </aside>
-      </>}
+    <div className="postly-app">
+      <input id="media-upload" type="file" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.webm" aria-label="Choose image or video files" multiple hidden disabled={isUploading} onChange={changeFiles} />
+      <div inert={Boolean(panel || composerOpen)}>
+        <Workspace
+          path={["/", "/home"].includes(window.location.pathname) ? "/home" : window.location.pathname}
+          organizationName={organizationName} onOrganizationChange={setOrganizationName}
+          connected={connected} socialStatus={socialStatus} channelProfiles={profiles}
+          channelDefinitions={channels.map((channel,index)=>({...channel,id:["6abbdc0fea19ca0bde244c7e","6abbdb9eea19ca0bde244939","6abbdadbea19ca0bde24433e"][index] || channel.name.toLowerCase(),icon:<SocialMark icon={channel.icon} brand={channel.brand} color={channel.color} size={17}/>}))}
+          records={records} onDelete={deletePost} onEdit={editPost} onDuplicate={duplicatePost} onBulkAction={changePosts} onRefreshPublish={refreshPublishStatus} onRefreshScheduledDelivery={refreshScheduledDeliveryStatuses} onRetryScheduledDelivery={retryScheduledChannel}
+          savedTemplates={personalTemplates} setSavedTemplates={setPersonalTemplates}
+          scheduledCount={scheduledPosts} onRefresh={refreshSocialStatus} onCompose={openComposer}
+          onConnect={network => { setConnectNetwork(typeof network === "string" ? network : "Instagram"); setPanel("Connect Channel"); }}
+        />
+      </div>
 
       {composerOpen && <>
         <button className="scrim composer-scrim" aria-label="Close composer overlay" onClick={requestCloseComposer} />
         <section inert={Boolean(panel)} className="composer-modal" role="dialog" aria-modal="true" aria-label="Create Post">
-          <header className="composer-header" inert={discardOpen}><div><h2>Create Post</h2><p>Create and edit posts</p></div><div className="composer-tools">
+          <header className="composer-header" inert={discardOpen}><div><h2>{editingId ? "Edit Post" : "Create Post"}</h2><p>Future posts stay in Postly's local queue and won't publish automatically.</p></div><div className="composer-tools">
               <button className={`composer-tool ${toolPanel === "templates" ? "tool-active" : ""}`} title="Templates" aria-label="Templates" onClick={() => { setToolPanel(toolPanel === "templates" ? "" : "templates"); setCustomize(false); }}><FileText size={17} /></button>
-              <button className={`composer-tool ${toolPanel === "ai" ? "tool-active" : ""}`} title="AI Assistant" aria-label="AI Assistant" onClick={() => { if (toolPanel === "ai") setToolPanel(""); else { setToolPanel("ai"); setAiStep(aiOnboarded ? 4 : 0); setAiReady(aiOnboarded); setCustomize(false); } }}><WandSparkles size={17} /></button>
+              <button className={`composer-tool ${toolPanel === "ai" ? "tool-active" : ""}`} title="Writing Assistant" aria-label="Writing Assistant" onClick={() => { if (toolPanel === "ai") setToolPanel(""); else { setToolPanel("ai"); setAiStep(aiOnboarded ? 4 : 0); setAiReady(aiOnboarded); setCustomize(false); } }}><WandSparkles size={17} /></button>
               <button className={`composer-tool ${toolPanel === "preview" ? "tool-active" : ""}`} title="Preview" aria-label="Preview" onClick={() => { setToolPanel(toolPanel === "preview" ? "" : "preview"); setCustomize(false); }}><ImageIcon size={17} /></button>
               <button className="icon-button" title="Close Composer" aria-label="Close Composer" onClick={requestCloseComposer}><X size={19} /></button>
             </div>
@@ -545,26 +823,45 @@ export function App() {
 
           <div inert={discardOpen} className={`composer-main ${toolPanel ? "with-panel" : ""}`}>
               <div className="editor-column">
-                <div className="channel-picker"><span className="field-label">Select channels</span><div className="channel-picker-list">{channels.map((channel, index) => <ChannelAvatar key={channel.name} channel={channel} active={selectedChannels.includes(index)} onClick={() => toggleChannel(index)} />)}<button className="add-channel-button" aria-label="Add channel" onClick={() => setPanel("Connect Channel")}><Plus size={17} /></button></div></div>
+                <div className="channel-picker">
+                  <div className="channel-picker-heading"><span id="channel-picker-label" className="field-label">Post to</span><span className="channel-selection-count">{selectedChannels.length} of {channels.length} selected</span></div>
+                  <div className="channel-picker-list" role="group" aria-labelledby="channel-picker-label">{channels.map((channel, index) => <ChannelAvatar key={channel.name} channel={channel} active={selectedChannels.includes(index)} onClick={() => toggleChannel(index)} />)}<button type="button" className="add-channel-button" aria-label="Add channel" onClick={() => setPanel("Connect Channel")}><Plus size={17} /></button></div>
+                  {!selectedChannels.length && <span className="channel-picker-hint" role="status">Select at least one channel to publish.</span>}
+                </div>
                 {customize ? <div className="customize-panel" data-popover>
                   <div className="customize-title"><div><h3>Customize for each channel</h3><p>Adjust settings for your selected channels.</p></div><button className="icon-button" aria-label="Close channel customization" onClick={() => setCustomize(false)}><X size={17} /></button></div>
                   <div className="customize-tabs">{channels.filter((channel, index) => selectedChannels.includes(index)).map((channel) => <button key={channel.name} className={activeChannel === channel.name ? "current" : ""} onClick={() => setActiveChannel(channel.name)}><SocialMark icon={channel.icon} brand={channel.brand} color={channel.color} size={14} />{channel.name}</button>)}</div>
+                  {scheduleMode === "Now" && publishValidationErrors.length > 0 && <div className="channel-validation" role="alert"><b>Review before publishing</b><ul>{publishValidationErrors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}</ul></div>}
+                  {scheduleMode !== "Now" && <p className="local-queue-hint" role="status">Scheduled delivery is saved on this Postly server. Due posts dispatch while the server runs and resume after a restart. Hosted background delivery is not set up.</p>}
                   <div className="customize-content">
-                    <label className="setting-label">Post type</label><div className="radio-row">{(activeChannel === "Instagram" ? ["Post", "Reel", "Story"] : activeChannel === "TikTok" ? ["Video", "Photo"] : ["Post"]).map((type, index) => <label key={type} className="radio-option"><input type="radio" name="post-type" checked={(postTypes[activeChannel] || (activeChannel === "TikTok" ? "Video" : "Post")) === type} onChange={() => setPostTypes(current => ({ ...current, [activeChannel]: type }))} />{type}</label>)}</div>
-                    <div className="media-placeholder"><Upload size={18} /><span>Add media for {activeChannel}</span><button onClick={() => document.getElementById("media-upload")?.click()}>Upload media</button></div>
-                    {activeChannel === "Instagram" && <><button className="setting-row" onClick={() => setUtilityMenu(utilityMenu === "music" ? "" : "music")}><span>Music</span><Plus size={15} /></button><button className="setting-row" onClick={() => setUtilityMenu(utilityMenu === "products" ? "" : "products")}><span>Tag Products</span><Plus size={15} /></button></>}
-                    {utilityMenu === "music" && <div className="setting-expansion">Add a video with its audio track using Upload media.</div>}{utilityMenu === "products" && <label className="setting-expansion">Product names or links<input aria-label="Product tags" value={productTags} onChange={event => setProductTags(event.target.value)} placeholder="Add product names or links" /></label>}<div className="setting-block"><label className="setting-label">Posting method</label><select value={postingMethods[activeChannel] || "Automatic"} onChange={event => setPostingMethods(current => ({ ...current, [activeChannel]: event.target.value }))}><option>Automatic</option><option>Notify Me</option></select><small>{postingMethods[activeChannel] === "Notify Me" ? "A reminder will prompt you to publish manually." : "Postly will post automatically for you."}</small></div>
+                    <label className="setting-label">Post type</label><div className="radio-row">{(activeChannel === "Instagram" ? ["Post", "Reel", "Story"] : activeChannel === "TikTok" ? ["Video", "Photo"] : activeChannel === "YouTube" ? ["Video", "Short"] : ["Post"]).map(type => <label key={type} className="radio-option"><input type="radio" name="post-type" disabled={activeChannel === "Instagram" && type === "Story"} checked={(postTypes[activeChannel] || (activeChannel === "TikTok" ? "Video" : "Post")) === type} onChange={() => setPostTypes(current => ({ ...current, [activeChannel]: type }))} />{type}</label>)}</div>
+                    {activeChannel === "Instagram" && <small className="setting-hint">Instagram publishing supports feed posts, Reels, and carousels. Story publishing is not available for this connection.</small>}
+                    <div className="media-placeholder"><Upload size={18} /><span>Add media for {activeChannel}</span><button type="button" disabled={isUploading} onClick={() => document.getElementById("media-upload")?.click()}>{isUploading ? "Saving media…" : "Choose files"}</button></div>
+                    <small className="setting-hint">{activeChannel === "TikTok" && postTypes.TikTok === "Photo" ? "TikTok Photo accepts JPEG or WebP images, up to 20 MB each." : activeChannel === "YouTube" || (activeChannel === "TikTok" && postTypes.TikTok === "Video") ? "Upload one MP4, MOV, or WebM video." : activeChannel === "Instagram" ? "Instagram supports up to 10 photos/videos. Use Post for photos or carousels and Reel for a single video." : "Media is saved on this device for your local queue."}</small>
+                    {activeChannel === "Instagram" && <><button className="setting-row" onClick={() => setUtilityMenu(utilityMenu === "music" ? "" : "music")}><span>Music</span><Plus size={15} /></button><button className="setting-row" onClick={() => setUtilityMenu(utilityMenu === "products" ? "" : "products")}><span>Tag Products</span><Plus size={15} /></button><small className="setting-hint">Music and product tags are saved as notes and aren't sent through this publishing connection.</small></>}
+                    {activeChannel === "TikTok" && <div className="setting-block provider-publish-settings">
+                      <label className="setting-label" htmlFor="tiktok-audience">Audience</label>
+                      {!socialStatus.tiktok?.connected ? <small>Connect a TikTok account to load its audience options.</small> : tiktokInfoLoading ? <small role="status">Loading TikTok account options…</small> : tiktokInfoError ? <small className="composer-error" role="alert">{tiktokInfoError}</small> : tiktokCreatorInfo ? <>
+                        <small>Posting to {tiktokCreatorInfo.nickname || tiktokCreatorInfo.username || "your TikTok account"}.</small>
+                        <select id="tiktok-audience" required value={tiktokPrivacyLevel} onChange={event => setTiktokPrivacyLevel(event.target.value)}><option value="">Choose an audience</option>{(tiktokCreatorInfo.privacyLevelOptions || []).map(option => <option key={option} value={option}>{({ PUBLIC_TO_EVERYONE: "Everyone", MUTUAL_FOLLOW_FRIENDS: "Friends", FOLLOWER_OF_CREATOR: "Followers", SELF_ONLY: "Only me" })[option] || option}</option>)}</select>
+                        <label className="setting-toggle-row"><span>Allow comments</span><input type="checkbox" checked={tiktokCreatorInfo.commentDisabled ? false : tiktokAllowComments} disabled={tiktokCreatorInfo.commentDisabled} onChange={event => setTiktokAllowComments(event.target.checked)} /></label>
+                        {postTypes.TikTok === "Video" && <><label className="setting-toggle-row"><span>Allow Duet</span><input type="checkbox" checked={tiktokCreatorInfo.duetDisabled ? false : tiktokAllowDuet} disabled={tiktokCreatorInfo.duetDisabled} onChange={event => setTiktokAllowDuet(event.target.checked)} /></label><label className="setting-toggle-row"><span>Allow Stitch</span><input type="checkbox" checked={tiktokCreatorInfo.stitchDisabled ? false : tiktokAllowStitch} disabled={tiktokCreatorInfo.stitchDisabled} onChange={event => setTiktokAllowStitch(event.target.checked)} /></label><small>Maximum video length for this account: {tiktokCreatorInfo.maxVideoPostDurationSec || "unknown"} seconds.</small></>}
+                        {postTypes.TikTok === "Photo" && <label className="setting-toggle-row"><span>Automatically add music</span><input type="checkbox" checked={tiktokAutoAddMusic} onChange={event => setTiktokAutoAddMusic(event.target.checked)} /></label>}
+                      </> : <small>Connect TikTok to load available audience settings.</small>}
+                    </div>}
+                    {activeChannel === "YouTube" && <div className="setting-block provider-publish-settings"><label className="setting-label" htmlFor="youtube-visibility">Video visibility</label><select id="youtube-visibility" value={youtubePrivacyStatus} onChange={event => setYoutubePrivacyStatus(event.target.value)}><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select><small>New YouTube uploads default to Private. Change this before publishing if you want another visibility.</small><small>The Short label is a planning cue; YouTube classifies Shorts from the uploaded video.</small></div>}
+                    {utilityMenu === "music" && <div className="setting-expansion">Add a video with its audio track using Upload media.</div>}{utilityMenu === "products" && <label className="setting-expansion">Product names or links<input aria-label="Product tags" value={productTags} onChange={event => setProductTags(event.target.value)} placeholder="Add product names or links" /></label>}<div className="setting-block"><label className="setting-label">Posting method</label><select value={postingMethods[activeChannel] || "Automatic"} onChange={event => setPostingMethods(current => ({ ...current, [activeChannel]: event.target.value }))}><option>Automatic</option><option>Notify Me</option></select><small>{postingMethods[activeChannel] === "Notify Me" ? "Notifications are not connected yet." : "Publish Now sends immediately. Future scheduled posts stay in Postly's local queue."}</small></div>
                     <button className="setting-row" onClick={() => setFirstComment((value) => !value)}><span>First Comment</span><span className={`switch ${firstComment ? "on" : ""}`} /></button>
-                    {firstComment && <textarea className="first-comment-input" aria-label="First comment" value={firstCommentText} onChange={event => setFirstCommentText(event.target.value)} placeholder="Write your first comment…" />}<button className="setting-row" onClick={() => setPanel("Invite a Team Member")}><span>Collaborators</span><Plus size={15} /></button>
-                    <button className="setting-row" onClick={() => setDisclosure(value => !value)}><span>AI-Generated disclosure</span><span className={`switch ${disclosure ? "on" : ""}`} /></button>
+                    {firstComment && <><textarea className="first-comment-input" aria-label="First comment" value={firstCommentText} onChange={event => setFirstCommentText(event.target.value)} placeholder="Write your first comment…" /><small className="setting-hint">First comments are saved in Postly but aren't published by these connections yet.</small></>}<button className="setting-row" onClick={() => setPanel("Invite a Team Member")}><span>Collaborators</span><Plus size={15} /></button>
+                    <button className="setting-row" onClick={() => setDisclosure(value => !value)}><span>AI-Generated disclosure</span><span className={`switch ${disclosure ? "on" : ""}`} /></button><small className="setting-hint">The AI-generated label is sent to TikTok. Other providers do not receive it yet.</small>
                   </div>
                 </div> : <>
                   <div className="editor-card">
                     {selectedTemplate && <div className="attached-template"><Tags size={13} />{selectedTemplate}<button aria-label="Remove template" onClick={() => setSelectedTemplate(null)}><X size={13} /></button></div>}
-                    <textarea aria-label="composer textbox" placeholder="Start writing or get inspired with Templates" value={postText} onChange={(event) => setPostText(event.target.value)} />
-                    <label className="upload-area" htmlFor="media-upload" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); changeFiles(event); }}><Upload size={17} /><span>Drag &amp; drop or <b>select a file</b></span></label>
-                    {uploadedFiles.length > 0 && <div className="file-list">{uploadedFiles.map((file, index) => <span key={`${file}-${index}`}><ImageIcon size={13} />{file}<button aria-label={`Remove ${file}`} onClick={() => removeFile(index)}><X size={12} /></button></span>)}</div>}
-                    <div className="editor-utility-row" data-popover><button aria-label="More integration options" onClick={() => setUtilityMenu(utilityMenu === "integrations" ? "" : "integrations")}><MoreHorizontal size={18} /></button><button aria-label="Select emoji" onClick={() => setUtilityMenu(utilityMenu === "emoji" ? "" : "emoji")}><Smile size={17} /></button><button aria-label="Hashtag Manager" onClick={() => setPanel("Hashtag Manager")}><Hash size={17} /></button>{utilityMenu && <div className="integration-menu popup-menu" role="menu">{utilityMenu === "emoji" ? <div className="emoji-options">{["✨", "🙌", "💡", "❤️", "🎉", "👋", "🌱", "📣"].map(emoji => <button key={emoji} aria-label={`Insert ${emoji}`} onClick={() => { setPostText(value => value + emoji); setUtilityMenu(""); }}>{emoji}</button>)}</div> : utilityMenu === "music" ? <span className="menu-note">Upload a video with your chosen audio track.</span> : <><button role="menuitem" onClick={() => { document.getElementById("media-upload").click(); setUtilityMenu(""); }}>Upload media</button><button role="menuitem" onClick={() => { setPanel("Add a link"); setUtilityMenu(""); }}>Add a link</button><button role="menuitem" onClick={() => { setPanel("Hashtag Manager"); setUtilityMenu(""); }}>Hashtag Manager</button></>}</div>}<span className="character-count">{2200 - postText.length} &nbsp; · &nbsp;5 hashtags left</span></div>
+                    <label className="copy-field-label" htmlFor="composer-copy">Post copy</label><textarea id="composer-copy" aria-label="composer textbox" aria-invalid={postText.length > 2200} placeholder="Write your post copy…" value={postText} onChange={(event) => setPostText(event.target.value)} />
+                    <button type="button" className={`upload-area ${mediaDragging ? "is-dragging" : ""}`} disabled={isUploading} onClick={() => document.getElementById("media-upload")?.click()} onDragEnter={event => { event.preventDefault(); setMediaDragging(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setMediaDragging(false); }} onDrop={event => { event.preventDefault(); setMediaDragging(false); changeFiles(event); }}><Upload size={17} /><span>{isUploading ? "Saving media…" : <>Drag &amp; drop or <b>choose files</b></>}</span></button><small className="setting-hint">{mediaTypeHint} Up to 35 files and 250 MB per post; individual network limits apply. Media is saved on this device.</small>
+                    {uploadedFiles.length > 0 && <div className="media-attachments" role="list" aria-label="Attached media">{uploadedFiles.map((file, index) => { const attachment = attachments[index]; const preview = attachment && mediaPreviews[attachment.id]; return <article className="media-attachment" role="listitem" key={`${attachment?.id || file}-${index}`}><div className="media-attachment-preview">{preview && attachment?.type.startsWith("video/") ? <video muted playsInline preload="metadata" src={preview} aria-label={`Video preview: ${file}`} /> : preview ? <img src={preview} alt={`Preview: ${file}`} /> : <ImageIcon size={20} aria-hidden="true" />}</div><span title={file}>{file}</span><button type="button" aria-label={`Remove ${file}`} disabled={isUploading} onClick={() => removeFile(index)}><X size={13} /></button></article>; })}</div>}
+                    <div className="editor-utility-row" data-popover><button aria-label="More integration options" onClick={() => setUtilityMenu(utilityMenu === "integrations" ? "" : "integrations")}><MoreHorizontal size={18} /></button><button aria-label="Select emoji" onClick={() => setUtilityMenu(utilityMenu === "emoji" ? "" : "emoji")}><Smile size={17} /></button><button aria-label="Hashtag Manager" onClick={() => setPanel("Hashtag Manager")}><Hash size={17} /></button>{utilityMenu && <div className="integration-menu popup-menu" role="menu">{utilityMenu === "emoji" ? <div className="emoji-options">{["✨", "🙌", "💡", "❤️", "🎉", "👋", "🌱", "📣"].map(emoji => <button key={emoji} aria-label={`Insert ${emoji}`} onClick={() => { setPostText(value => value + emoji); setUtilityMenu(""); }}>{emoji}</button>)}</div> : utilityMenu === "music" ? <span className="menu-note">Upload a video with your chosen audio track.</span> : <><button role="menuitem" onClick={() => { document.getElementById("media-upload").click(); setUtilityMenu(""); }}>Upload media</button><button role="menuitem" onClick={() => { setPanel("Add a link"); setUtilityMenu(""); }}>Add a link</button><button role="menuitem" onClick={() => { setPanel("Hashtag Manager"); setUtilityMenu(""); }}>Hashtag Manager</button></>}</div>}<span className="character-count" aria-label="Character count">{postText.length} / 2,200 characters</span></div>
                   </div>
                 </>}
               </div>
@@ -575,23 +872,22 @@ export function App() {
                 <label className="template-search" data-popover><Search size={15} /><input placeholder="Search templates" value={templateQuery} onChange={(event) => setTemplateQuery(event.target.value)} /><button type="button" aria-label="Filter templates" onClick={() => setFilterOpen((value) => !value)}><Filter size={15} /></button></label>
                 {filterOpen && <div className="filter-popover" data-popover><strong>Filter templates</strong><label><input type="checkbox" checked={socialOnly} onChange={event => setSocialOnly(event.target.checked)} /> Social posts</label><label><input type="checkbox" checked={savedOnly} onChange={event => setSavedOnly(event.target.checked)} /> Saved templates</label></div>}
                 <button className="new-template-button" onClick={() => { setTemplateEditor(true); setTemplateName(""); setTemplateBody(""); }}><Plus size={15} />New Template</button>
-                {templateEditor && <form className="template-editor" onSubmit={event => { event.preventDefault(); if (!templateName.trim() || !templateBody.trim()) return; setPersonalTemplates(current => [{ title: templateName.trim(), description: templateBody.trim(), icon: "question" }, ...current.filter(item => item.title !== templateName.trim())]); setTemplateTab("Personal"); setTemplateQuery(""); setSavedOnly(false); setTemplateEditor(false); }}><label>Template name<input required value={templateName} onChange={event => setTemplateName(event.target.value)} /></label><label>Post content<textarea required rows={4} value={templateBody} onChange={event => setTemplateBody(event.target.value)} /></label><div><button type="button" onClick={() => setTemplateEditor(false)}>Cancel</button><button type="submit">Save Template</button></div></form>}<div className="drawer-template-list">{filteredTemplates.map((item) => <button key={item.title} className={`drawer-template ${selectedTemplate === item.title ? "chosen" : ""}`} onClick={() => useTemplate(item)}><span className="template-icon"><TemplateIcon name={item.icon} /></span><span><b>{item.title}</b><small>{item.description}</small></span></button>)}{filteredTemplates.length === 0 && <p className="no-results">No templates match your search.</p>}</div>
-              </aside> : toolPanel === "preview" ? <aside className="preview-panel"><div className="panel-title"><div><h3>Post Previews</h3></div></div>{postText.trim() || uploadedFiles.length ? selectedChannels.length ? selectedChannels.map(index => <article className="social-preview" key={index}><div className="preview-account"><span className="preview-avatar"><UserRound size={18}/></span><span><b>{channels[index].handle}</b><small>{channels[index].name} · Just now</small></span><SocialMark icon={channels[index].icon} brand={channels[index].brand} color={channels[index].color} size={15}/></div><p>{postText}</p>{uploadedFiles.map((file, index) => <div className="preview-media" key={index}>{mediaPreviews[attachments[index]?.id] ? attachments[index]?.type.startsWith("video/") ? <video controls src={mediaPreviews[attachments[index].id]} aria-label={file} /> : <img src={mediaPreviews[attachments[index].id]} alt={file} /> : <ImageIcon size={25}/>}<span>{file}</span></div>)}</article>) : <p className="no-results">Select a channel to preview your post.</p> : <div className="preview-empty"><ImageIcon size={25} /><p>See your post's preview here</p></div>}</aside> : toolPanel === "ai" ? <aside className="ai-panel"><div className="ai-panel-title"><WandSparkles size={15} /><h3>AI Assistant</h3></div>
-                {aiStep < 4 ? <><h4 className="ai-step-title">{aiStep === 0 ? <>Hi, I'm your assistant <span className="source-emoji">👋</span></> : <>Useful things to know about me<ArrowDown size={15} /></>}</h4><div className="ai-step-card">{aiStep === 0 ? <><strong>I can help you:</strong><ul><li><WandSparkles size={13} />Write about any topic</li><li><FileText size={13} />Revise content</li><li><ArrowUpRight size={13} />Repurpose posts across networks</li></ul></> : aiStep === 1 ? <><div className="ai-brand-row"><SocialMark icon={siThreads} color="#a96ef4" size={34} /><SocialMark icon={siTiktok} color="#a96ef4" size={32} /><SocialMark icon={siInstagram} color="#a96ef4" size={32} /></div><p>I understand the channel you're posting to and will tailor my suggestions for that audience.</p></> : aiStep === 2 ? <><Unlink className="ai-step-icon" size={34} /><p>I don't have internet access and can't view any URLs you share.</p></> : <><AlertTriangle className="ai-step-icon" size={34} /><p>I sometimes, unintentionally, can share wrong or offensive information and have limited knowledge of events after Oct 2023.</p></>}</div><div className="ai-dots"><i className={aiStep === 0 ? "active" : ""} /><i className={aiStep === 1 ? "active" : ""} /><i className={aiStep === 2 ? "active" : ""} /><i className={aiStep === 3 ? "active" : ""} /></div><button className="ai-next" onClick={() => { if (aiStep < 3) setAiStep((value) => value + 1); else { setAiOnboarded(true); setAiStep(4); setAiReady(false); window.setTimeout(() => setAiReady(true), 900); } }}>{aiStep === 3 ? "Got It" : "Next"}</button></> : aiReady ? <div className="ai-ready"><label htmlFor="ai-prompt">What do you want to write about?</label><textarea id="ai-prompt" placeholder="Eg. Promote my photography course to get new signups. Registration closes in 3 days." value={aiPrompt} onChange={(event) => setAiPrompt(event.target.value)} /><p><strong>Pro tip:</strong> Include key points, your target audience and your desired outcome for this post</p><button className="ai-generate" disabled={!aiPrompt.trim()} onClick={() => { setPostText(`Here’s a draft based on your idea:\n\n${aiPrompt.trim()}`); setToolPanel(""); notify("AI draft added to your post"); }}><WandSparkles size={15} />Generate</button><a href="https://support.buffer.com/articles/using-buffers-ai-assistant-qbBulfw9sn" target="_blank" rel="noreferrer"><CircleHelp size={14} />Learn more about <u>creating great prompts and the known limitations of AI.</u><ArrowUpRight size={13} /></a></div> : <div className="ai-loading">Setting things up</div>}</aside> : null}
+                {templateEditor && <form className="template-editor" onSubmit={event => { event.preventDefault(); if (!templateName.trim() || !templateBody.trim()) return; setPersonalTemplates(current => [{ id: crypto.randomUUID(), title: templateName.trim(), description: templateBody.trim(), icon: "question" }, ...current.filter(item => item.title !== templateName.trim())]); setTemplateTab("Personal"); setTemplateQuery(""); setSavedOnly(false); setTemplateEditor(false); }}><label>Template name<input required value={templateName} onChange={event => setTemplateName(event.target.value)} /></label><label>Post content<textarea required rows={4} value={templateBody} onChange={event => setTemplateBody(event.target.value)} /></label><div><button type="button" onClick={() => setTemplateEditor(false)}>Cancel</button><button type="submit">Save Template</button></div></form>}<div className="drawer-template-list">{filteredTemplates.map((item) => <button key={item.title} className={`drawer-template ${selectedTemplate === item.title ? "chosen" : ""}`} onClick={() => useTemplate(item)}><span className="template-icon"><TemplateIcon name={item.icon} /></span><span><b>{item.title}</b><small>{item.description}</small></span></button>)}{filteredTemplates.length === 0 && <p className="no-results">No templates match your search.</p>}</div>
+              </aside> : toolPanel === "preview" ? <aside className="preview-panel"><div className="panel-title"><div><h3>Post Previews</h3></div></div>{postText.trim() || uploadedFiles.length ? selectedChannels.length ? selectedChannels.map(index => <article className="social-preview" key={index}><div className="preview-account"><span className="preview-avatar"><UserRound size={18}/></span><span><b>{channels[index].handle}</b><small>{channels[index].name} · Just now</small></span><SocialMark icon={channels[index].icon} brand={channels[index].brand} color={channels[index].color} size={15}/></div><p>{postText}</p>{uploadedFiles.map((file, index) => <div className="preview-media" key={index}>{mediaPreviews[attachments[index]?.id] ? attachments[index]?.type.startsWith("video/") ? <video controls src={mediaPreviews[attachments[index].id]} aria-label={file} /> : <img src={mediaPreviews[attachments[index].id]} alt={file} /> : <ImageIcon size={25}/>}<span>{file}</span></div>)}</article>) : <p className="no-results">Select a channel to preview your post.</p> : <div className="preview-empty"><ImageIcon size={25} /><p>See your post's preview here</p></div>}</aside> : toolPanel === "ai" ? <aside className="ai-panel"><div className="ai-panel-title"><WandSparkles size={15}/><h3>Writing Assistant</h3></div><div className="ai-ready"><p className="panel-note">AI generation is not connected. Use a template for inspiration, or collect your own writing brief here.</p><button className="new-template-button" onClick={()=>setToolPanel("templates")}><FileText size={15}/> Browse templates</button><label htmlFor="ai-prompt">What do you want to share?</label><textarea id="ai-prompt" placeholder="Your topic, audience, key points, and the next step you want readers to take." value={aiPrompt} onChange={event=>setAiPrompt(event.target.value)}/><button className="ai-generate" disabled={!aiPrompt.trim()} onClick={()=>{setPostText(current=>[current,aiPrompt.trim()].filter(Boolean).join("\n\n"));setToolPanel("");notify("Writing brief added to your post")}}>Add writing brief</button></div></aside> : null}
           </div>
 
           <footer className="composer-footer" inert={discardOpen}>
-            <div className="footer-top-row">{isUploading && <span role="status" className="composer-status">Saving media…</span>}{customize && postError && <span role="alert" className="composer-error">{postError}</span>}<label className="create-another"><input type="checkbox" checked={createAnother} onChange={(event) => setCreateAnother(event.target.checked)} />Create Another</label><button className="secondary-button" disabled={isUploading || (!postText.trim() && uploadedFiles.length === 0)} onClick={saveDraft}>Save Draft</button></div>
+            <div className="footer-top-row">{isUploading && <span role="status" className="composer-status">Saving media…</span>}{isPublishing && <span role="status" className="composer-status">Publishing to selected channels…</span>}{isScheduling && <span role="status" className="composer-status">Saving scheduled delivery…</span>}{customize && postError && <span role="alert" className="composer-error">{postError}</span>}{publishError && <span role="alert" className="composer-error">{publishError}</span>}<label className="create-another"><input type="checkbox" checked={createAnother} onChange={(event) => setCreateAnother(event.target.checked)} />Create Another</label><button type="button" className="secondary-button" disabled={isUploading || isPublishing || isScheduling || (!postText.trim() && uploadedFiles.length === 0)} onClick={saveDraft}>Save Draft</button><button type="button" className="secondary-button composer-cancel" disabled={isUploading || isPublishing || isScheduling} onClick={requestCloseComposer}>Cancel</button></div>
             <div className="footer-actions">
-              <div className="schedule-wrap"><button className="schedule-select" aria-label="Choose date and time" aria-expanded={datePickerOpen} onClick={() => { setScheduleMenuOpen(false); setDateTimeSet(true); setDatePickerOpen((value) => !value); }}><CalendarDays size={16} />{scheduleLabel}<ChevronDown size={15} /></button></div>
-              <button className="primary-button" disabled={isUploading || (customize && ((!postText.trim() && uploadedFiles.length === 0) || Boolean(postError)))} onClick={() => { if (customize) schedulePost(); else { setCustomize(true); setActiveChannel(channels[selectedChannels[0] ?? 0].name); setToolPanel(""); setUtilityMenu(""); } }}>{customize ? "Schedule Posts" : <>Customize <ArrowRight size={15} /></>}</button>
+              <div className="schedule-wrap"><button type="button" className="schedule-select" aria-label="Choose date and time" aria-expanded={datePickerOpen} onClick={() => { setDateTimeSet(true); setDatePickerOpen(value => !value); }}><CalendarDays size={16} />{scheduleLabel}<ChevronDown size={15} /></button></div>
+              <button className="primary-button" disabled={isUploading || isPublishing || isScheduling || (customize && ((!postText.trim() && uploadedFiles.length === 0) || Boolean(postError) || (scheduleMode === "Now" && publishValidationErrors.length > 0)))} onClick={() => { if (customize) schedulePost(); else { setCustomize(true); setActiveChannel(channels[selectedChannels[0] ?? 0].name); setToolPanel(""); setUtilityMenu(""); setPublishError(""); } }}>{isPublishing ? "Publishing…" : isScheduling ? "Saving schedule…" : customize ? scheduleMode === "Now" ? "Publish now" : "Schedule post" : <>Customize <ArrowRight size={15} /></>}</button>
             </div>
           </footer>
           {datePickerOpen && <div inert={discardOpen} className="date-time-picker" role="dialog" aria-label="Schedule date and time">
-            <div className="calendar-header"><h3>{calendarMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</h3><div><button className="icon-button" aria-label="Previous month" disabled={calendarMonth.getFullYear() === new Date().getFullYear() && calendarMonth.getMonth() <= new Date().getMonth()} onClick={() => setCalendarMonth((month) => new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={16} /></button><button className="icon-button" aria-label="Next month" onClick={() => setCalendarMonth((month) => new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={16} /></button></div></div>
-            <div className="calendar-weekdays">{"SMTWTFS".split("").map((day, index) => <span key={`${day}-${index}`}>{day}</span>)}</div>
+            <div className="calendar-header"><h3>{calendarMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</h3><div><button className="icon-button" aria-label="Previous month" disabled={calendarMonth.getFullYear() < scheduleToday.getFullYear() || (calendarMonth.getFullYear() === scheduleToday.getFullYear() && calendarMonth.getMonth() <= scheduleToday.getMonth())} onClick={() => setCalendarMonth((month) => new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={16} /></button><button className="icon-button" aria-label="Next month" onClick={() => setCalendarMonth((month) => new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={16} /></button></div></div>
+            <div className="calendar-weekdays">{(startOfWeek === "Monday" ? "MTWTFSS" : "SMTWTFS").split("").map((day, index) => <span key={`${day}-${index}`}>{day}</span>)}</div>
             <div className="calendar-days">{calendarDays.map((day) => {
-              const today = new Date(); today.setHours(0, 0, 0, 0);
+              const today = calendarDateInTimezone(new Date(), scheduleTimezone); today.setHours(0, 0, 0, 0);
               const isCurrentMonth = day.getMonth() === calendarMonth.getMonth();
               const isSelected = day.toDateString() === selectedDate.toDateString();
               return <button key={day.toISOString()} type="button" disabled={day < today} className={`${isCurrentMonth ? "" : "outside-month"} ${isSelected ? "selected" : ""}`} onClick={() => setSelectedDate(new Date(day.getFullYear(), day.getMonth(), day.getDate()))}>{day.getDate()}</button>;
@@ -599,17 +895,19 @@ export function App() {
             <div className="date-time-footer">
               <label htmlFor="schedule-time">Select Time</label>
               <div className="time-input-wrap"><Clock3 size={15} /><input id="schedule-time" aria-label="Select Time" value={selectedTime} onChange={(event) => setSelectedTime(event.target.value)} /></div>
-              {dateError && <span className="composer-error" role="alert">{dateError}</span>}<span className="timezone-label">{Intl.DateTimeFormat().resolvedOptions().timeZone}</span>
-              <div className="date-picker-actions"><button className="more-posting-actions" onClick={() => setScheduleMenuOpen((value) => !value)}><ChevronLeft size={14} />More Posting Actions</button><button className="date-picker-done" disabled={Boolean(dateError)} onClick={() => { if (dateError) return; setDatePickerOpen(false); setScheduleMenuOpen(false); setDateTimeSet(true); setScheduleMode("Date & Time"); }}>Done</button></div>
+              {dateError && <span className="composer-error" role="alert">{dateError}</span>}<span className="timezone-label">Time zone: {scheduleTimezone === "Johannesburg" ? "Johannesburg" : resolveTimezone(scheduleTimezone)}</span>
+              <div className="date-picker-actions"><Popover label="More posting actions" className="schedule-actions-disclosure" panelClassName="date-time-actions-popover" buttonClassName="more-posting-actions" align="left" trigger={<><ChevronLeft size={14} />More Posting Actions</>}>{close => scheduleOptions.map(option => <button key={option.label} type="button" onClick={() => { chooseSchedule(option.label); close(); if (option.label !== "Set Date and Time") window.requestAnimationFrame(() => document.querySelector(".schedule-select")?.focus()); }} className={scheduleMode === (option.label === "Set Date and Time" ? "Date & Time" : option.label) ? "selected" : ""}><span>{option.label}</span><small>{option.detail}</small></button>)}</Popover><button type="button" className="date-picker-done" disabled={Boolean(dateError)} onClick={() => { if (dateError) return; setDatePickerOpen(false); setDateTimeSet(true); setScheduleMode("Date & Time"); }}>Done</button></div>
             </div>
-            {scheduleMenuOpen && <div className="date-time-actions-menu">{scheduleOptions.map((option) => <button key={option.label} onClick={() => chooseSchedule(option.label)} className={scheduleMode === (option.label === "Set Date and Time" ? "Date & Time" : option.label) ? "selected" : ""}><span>{option.label}</span><small>{option.detail}</small></button>)}</div>}
           </div>}
           {discardOpen && <div className="discard-layer"><button className="scrim" aria-label="Keep editing" onClick={() => setDiscardOpen(false)} /><section className="discard-dialog" role="alertdialog" aria-modal="true" aria-label="Unsaved post"><h3>Save your changes?</h3><p>Your post has unsaved changes.</p><div><button onClick={() => setDiscardOpen(false)}>Keep Editing</button><button onClick={closeComposer}>Discard Changes</button><button onClick={saveDraft}>Save Draft</button></div></section></div>}
         </section>
       </>}
 
-      {panel && <InteractionPanel key={panel} title={panel} onClose={() => setPanel("")} posts={records} connected={connected} onSave={(title, value) => { if (title === "Organization settings") setOrganizationName(value); }} onConnect={(network, handle) => { setProfiles(current => ({ ...current, [network]: handle })); setConnected(current => current.includes(network) ? current : [...current, network]); notify(`${network} profile saved locally`); }} onEdit={editPost} onDelete={deletePost} onNotify={(value, insert) => insert ? setPostText(current => `${current}${current ? "\n" : ""}${value}`) : setPanel(value)} />}
-      {toast && <div role="status" className="toast"><CheckCircle2 size={17} />{toast}</div>}
+      {panel && <InteractionPanel key={panel} title={panel} initialNetwork={connectNetwork} onClose={() => { setPanel(""); const clean = new URL(window.location.href); clean.searchParams.delete("panel"); clean.searchParams.delete("network"); history.replaceState({}, "", clean.pathname + clean.search); }} posts={records} connected={connected} onSave={(title, value) => { if (title === "Organization settings") setOrganizationName(value); }} onConnect={(network, handle) => { setProfiles(current => ({ ...current, [network]: handle })); setConnected(current => current.includes(network) ? current : [...current, network]); notify(`${network} profile saved locally`); }} onEdit={editPost} onDelete={deletePost} onRefreshPublish={refreshPublishStatus} onNotify={(value, insert) => insert ? setPostText(current => `${current}${current ? "\n" : ""}${value}`) : setPanel(value)} />}
+      <div className="postly-notices">
+        {toast && <div role="status" className="toast"><CheckCircle2 size={17} />{toast}</div>}
+        {postUndo && <div className="postly-undo-notice"><span role="status">{postUndo.message}</span><button onClick={undoPosts}>Undo</button><button aria-label="Dismiss undo" onClick={() => setPostUndo(null)}><X size={16}/></button></div>}
+      </div>
     </div>
   );
 }
